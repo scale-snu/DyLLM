@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from dyllm.config import Config
 from dyllm.engine.sequence import Sequence
-from dyllm.model_executor.models import LLaDAForDLM, DreamForDLM
+from dyllm.model_executor.models import LLaDAForDLM, LLaDAMoEForDLM, DreamForDLM
 
 from dyllm.model_executor.layers.sampler import LLaDASampler, DreamSampler
 
@@ -41,7 +41,10 @@ class ModelRunner:
             self.model = DreamForDLM(hf_config, config.threshold)
             self.sampler = DreamSampler("entropy")
         elif hf_config.model_type == "llada":
-            self.model = LLaDAForDLM(hf_config, config.threshold)
+            if getattr(hf_config, "num_experts", 0) and hf_config.num_experts > 0:
+                self.model = LLaDAMoEForDLM(hf_config, config.threshold)
+            else:
+                self.model = LLaDAForDLM(hf_config, config.threshold)
             self.sampler = LLaDASampler("confidence")
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
