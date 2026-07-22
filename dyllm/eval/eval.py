@@ -129,6 +129,10 @@ def main():
         print(json.dumps(results.get("results", results), indent=2, default=str))
 
 
-if __name__ == "__main__":
+def cli():
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     main()
+
+
+if __name__ == "__main__":
+    cli()

@@ -120,5 +120,10 @@ setup(
     packages=find_packages(include=["dyllm*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    entry_points={
+        "console_scripts": [
+            "dyllm-eval = dyllm.eval.eval:cli",
+        ],
+    },
     zip_safe=False,
 )
