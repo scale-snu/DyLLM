@@ -354,3 +354,208 @@ class DreamSampler(BaseSampler):
         else:
             raise ValueError(f"Unsupported algorithm for Dream: {self.algorithm}")
         return scores
+
+
+def _diffusiongemma_row_stats(logits: torch.Tensor, temp: torch.Tensor, softcap: float):
+    """Per-row statistics of processed = softcap(logits) / temp, in fp32
+    (logits.to(float32) -> softcap -> temperature -> entropy).
+    logits [n, V] (any dtype), temp [n] fp32 -> argmax [n], entropy [n] fp32,
+    probs [n, V] in the logits dtype (self-conditioning input)."""
+    x = logits.float()
+    if softcap > 0:
+        x = torch.tanh(x / softcap) * softcap
+    x = x / temp[:, None]
+    normalized = x - torch.logsumexp(x, dim=-1, keepdim=True)
+    probs = torch.softmax(normalized, dim=-1)
+    entropy = -(normalized * probs).sum(-1)
+    return torch.argmax(x, dim=-1), entropy, probs.to(logits.dtype)
+
+
+_diffusiongemma_row_stats_compiled = None
+
+
+def _diffusiongemma_row_stats_fn(device):
+    """torch.compile'd on cuda; eager otherwise."""
+    global _diffusiongemma_row_stats_compiled
+    if device.type != "cuda":
+        return _diffusiongemma_row_stats
+    if _diffusiongemma_row_stats_compiled is None:
+        _diffusiongemma_row_stats_compiled = torch.compile(_diffusiongemma_row_stats, dynamic=True)
+    return _diffusiongemma_row_stats_compiled
+
+
+class DiffusionGemmaSampler(nn.Module):
+    """Entropy-bound canvas sampler for DiffusionGemma
+
+    ``cur_steps`` counts denoising steps remaining (``max_denoising_steps`` down to 1).
+    Per-request values (entropy bound, temperature schedule, stopping thresholds)
+    are passed per call -- the engine batches them as ``[B]`` tensors, matching the
+    other samplers. The acceptance mask and the argmax history are passed in and
+    returned rather than stored, so per-sequence state lives with the sequence.
+    """
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+
+    def temperature(self, cur_steps, t_min, t_max, max_denoising_steps):
+        return t_min + (t_max - t_min) * (cur_steps / max_denoising_steps)
+
+    def sample(self, logits: torch.Tensor, cur_steps, t_min, t_max, max_denoising_steps,
+               softcap=None, chunk: int = 1024):
+        """One stochastic step over processed = softcap(logits) / temp, in fp32
+        (logits.to(float32) -> softcap -> temperature).
+        Returns (denoiser, argmax, entropy, probs); probs stays fp32 -- the
+        multinomial draws from it. Row-chunked except the draw itself, which runs
+        on the whole canvas so the RNG stream matches a single-shot sampler."""
+        temp = self.temperature(cur_steps, t_min, t_max, max_denoising_steps)
+        temp = torch.as_tensor(temp, device=logits.device, dtype=torch.float32).reshape(-1)
+        lead = logits.shape[:-1]
+        flat = logits.reshape(-1, logits.shape[-1])
+        temp_rows = temp.repeat_interleave(flat.shape[0] // temp.numel())
+        probs = torch.empty(flat.shape, dtype=torch.float32, device=flat.device)
+        argmax = torch.empty(flat.shape[0], dtype=torch.long, device=flat.device)
+        entropy = torch.empty(flat.shape[0], dtype=torch.float32, device=flat.device)
+        cap = float(softcap) if softcap else 0.0
+        for i in range(0, flat.shape[0], chunk):
+            x = flat[i : i + chunk].float()
+            if cap > 0:
+                x = torch.tanh(x / cap) * cap
+            x = x / temp_rows[i : i + chunk, None]
+            p = torch.softmax(x, dim=-1)
+            probs[i : i + chunk] = p
+            entropy[i : i + chunk] = -(p * (x - torch.logsumexp(x, dim=-1, keepdim=True))).sum(-1)
+            argmax[i : i + chunk] = x.argmax(-1)
+        denoiser = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        return denoiser.view(lead), argmax.view(lead), entropy.view(lead), probs.view(*lead, -1)
+
+    @staticmethod
+    def _row_entropy(logits: torch.Tensor, chunk: int = 1024) -> torch.Tensor:
+        # row-wise, so chunking is exact; keeps the [rows, vocab] temporaries small
+        flat = logits.reshape(-1, logits.shape[-1])
+        ent = torch.cat([dists.Categorical(logits=flat[i : i + chunk]).entropy() for i in range(0, flat.shape[0], chunk)])
+        return ent.view(logits.shape[:-1])
+
+    def stats(self, logits: torch.Tensor, cur_steps, t_min, t_max, max_denoising_steps, softcap=None, chunk: int = 1024):
+        """Deterministic step statistics over processed = softcap(logits) / temp:
+        argmax [.., L], entropy [.., L] fp32, probs [.., L, V] (SC input).
+        ``cur_steps``/``t_*`` index dim 0 of ``logits`` (a seq, or a row when the
+        caller passes ``[rows, 1, V]``). Row-chunked so the fp32 temporaries stay
+        small; the row function is torch.compile'd on cuda. Chunks are written into
+        preallocated outputs -- collecting them for a final ``cat`` would hold two
+        full [rows, vocab] copies at once."""
+        temp = self.temperature(cur_steps, t_min, t_max, max_denoising_steps)
+        temp = torch.as_tensor(temp, device=logits.device, dtype=torch.float32).reshape(-1)
+        lead = logits.shape[:-1]
+        flat = logits.reshape(-1, logits.shape[-1])
+        temp_rows = temp.repeat_interleave(flat.shape[0] // temp.numel())
+        fn = _diffusiongemma_row_stats_fn(logits.device)
+        cap = float(softcap) if softcap else 0.0
+        rows, dev = flat.shape[0], flat.device
+        argmax = torch.empty(rows, dtype=torch.long, device=dev)
+        entropy = torch.empty(rows, dtype=torch.float32, device=dev)
+        probs = torch.empty_like(flat)
+        for i in range(0, rows, chunk):
+            a, e, p = fn(flat[i : i + chunk], temp_rows[i : i + chunk], cap)
+            argmax[i : i + chunk] = a
+            entropy[i : i + chunk] = e
+            probs[i : i + chunk] = p
+        return argmax.view(lead), entropy.view(lead), probs.view(*lead, -1)
+
+    def accept(
+        self,
+        current_canvas: torch.Tensor,
+        denoiser_canvas: torch.Tensor,
+        processed_logits: torch.Tensor,
+        entropy_bound,
+    ):
+        return self.accept_from_entropy(current_canvas, denoiser_canvas, self._row_entropy(processed_logits), entropy_bound)
+
+    def accept_from_entropy(self, current_canvas, denoiser_canvas, token_entropy, entropy_bound):
+        sorted_entropy, sorted_indices = torch.sort(token_entropy, dim=-1, descending=False)
+        bound = entropy_bound.unsqueeze(-1) if isinstance(entropy_bound, torch.Tensor) else entropy_bound
+        # accept in entropy order while the entropy mass accepted before each row stays under the bound
+        sorted_mask = torch.cumsum(sorted_entropy, dim=-1) - sorted_entropy <= bound
+        accepted_mask = torch.scatter(torch.zeros_like(sorted_mask), -1, sorted_indices, sorted_mask)
+        return torch.where(accepted_mask, denoiser_canvas, current_canvas), accepted_mask
+
+    def renoise(self, accepted_canvas: torch.Tensor, accepted_mask: torch.Tensor) -> torch.Tensor:
+        random_canvas = torch.randint(
+            0, self.vocab_size, accepted_canvas.shape, device=accepted_canvas.device
+        )
+        return torch.where(accepted_mask, accepted_canvas, random_canvas)
+
+    def check_stop(
+        self,
+        argmax_canvas: torch.Tensor,
+        processed_logits: torch.Tensor,
+        history: Optional[torch.Tensor],
+        convergence_threshold,
+        stability_threshold: int,
+    ):
+        return self.check_stop_from_entropy(
+            argmax_canvas, self._row_entropy(processed_logits), history, convergence_threshold, stability_threshold
+        )
+
+    def check_stop_from_entropy(self, argmax_canvas, token_entropy, history, convergence_threshold, stability_threshold):
+        if stability_threshold == 0:
+            stable = torch.ones(argmax_canvas.shape[0], dtype=torch.bool, device=argmax_canvas.device)
+        else:
+            if history is None:
+                history = torch.full(
+                    (stability_threshold, *argmax_canvas.shape),
+                    -1,
+                    dtype=argmax_canvas.dtype,
+                    device=argmax_canvas.device,
+                )
+            stable = (history == argmax_canvas[None]).all(dim=-1).all(dim=0)
+            history = torch.roll(history, shifts=-1, dims=0)
+            history[-1] = argmax_canvas
+        mean_entropy = token_entropy.mean(dim=-1)
+        confident = mean_entropy < convergence_threshold
+        # per-row: already below the stop threshold (salient path may freeze these rows)
+        thr = convergence_threshold.unsqueeze(-1) if isinstance(convergence_threshold, torch.Tensor) else convergence_threshold
+        converged = token_entropy < thr
+        return stable & confident, history, converged
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        canvas: torch.Tensor,
+        history: Optional[torch.Tensor],
+        cur_steps,
+        *,
+        entropy_bound,
+        t_min,
+        t_max,
+        max_denoising_steps,
+        convergence_threshold,
+        stability_threshold: int,
+        deterministic: bool = False,
+        softcap=None,
+    ):
+        """One denoising step; freezing finished rows stays with the caller.
+        Returns (new_canvas, argmax, probs, stop, history, converged); ``probs`` =
+        softmax(softcap(logits) / temp), the next step's self-conditioning input.
+        ``logits`` are the raw LM-head logits when ``softcap`` is given; both
+        paths apply it in fp32.
+
+        ``deterministic``: argmax input tokens and no re-noise -- rejected positions
+        keep their current token so contexts can stabilize across steps.
+        """
+        if deterministic:
+            argmax_canvas, token_entropy, processed = self.stats(
+                logits, cur_steps, t_min, t_max, max_denoising_steps, softcap
+            )
+            new_canvas, _ = self.accept_from_entropy(canvas, argmax_canvas, token_entropy, entropy_bound)
+        else:
+            denoiser_canvas, argmax_canvas, token_entropy, probs = self.sample(
+                logits, cur_steps, t_min, t_max, max_denoising_steps, softcap
+            )
+            accepted, accepted_mask = self.accept_from_entropy(canvas, denoiser_canvas, token_entropy, entropy_bound)
+            new_canvas = self.renoise(accepted, accepted_mask)
+            processed = probs.to(logits.dtype)
+        stop, history, converged = self.check_stop_from_entropy(
+            argmax_canvas, token_entropy, history, convergence_threshold, stability_threshold
+        )
+        return new_canvas, argmax_canvas, processed, stop, history, converged

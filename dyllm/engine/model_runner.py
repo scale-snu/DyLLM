@@ -7,13 +7,15 @@ from multiprocessing.shared_memory import SharedMemory
 
 from dyllm.config import Config
 from dyllm.engine.sequence import Sequence
-from dyllm.model_executor.models import LLaDAForDLM, LLaDAMoEForDLM, DreamForDLM
+from dyllm.model_executor.models import LLaDAForDLM, LLaDAMoEForDLM, DreamForDLM, DiffusionGemmaForDLM
 
-from dyllm.model_executor.layers.sampler import LLaDASampler, DreamSampler
+from dyllm.model_executor.layers.sampler import LLaDASampler, DreamSampler, DiffusionGemmaSampler
 
 from dyllm.utils.context import set_context, get_context, reset_context
 from dyllm.utils.weight_loader import load_model
 from dyllm.utils.metadata import get_metadata
+
+_FULL_STEPS = 2  # first denoise steps of a canvas run dense
 
 
 class ModelRunner:
@@ -27,7 +29,6 @@ class ModelRunner:
         self.event = event
 
         # Initialize distributed process group.
-        # Prefer per-engine allocated port from config to avoid overlap across runs.
         port = config.dist_port if config.dist_port is not None else int(os.environ.get("DYLLM_DIST_PORT", "29500"))
         dist.init_process_group(
             backend="nccl", init_method=f"tcp://localhost:{port}", world_size=self.world_size, rank=rank
@@ -35,8 +36,9 @@ class ModelRunner:
 
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_dtype(getattr(torch, getattr(config, "dtype", "bfloat16")))
         torch.set_default_device("cuda")
+        self.is_diffusiongemma = hf_config.model_type == "diffusion_gemma"
         if hf_config.model_type == "Dream":
             self.model = DreamForDLM(hf_config, config.threshold)
             self.sampler = DreamSampler("entropy")
@@ -46,6 +48,17 @@ class ModelRunner:
             else:
                 self.model = LLaDAForDLM(hf_config, config.threshold)
             self.sampler = LLaDASampler("confidence")
+        elif hf_config.model_type == "diffusion_gemma":
+            # the self-conditioning signal comes from the rank-0 sampler; TP would need a vocab-shard all-reduce
+            assert config.tensor_parallel_size == 1, "DiffusionGemma requires tensor_parallel_size == 1"
+            self.model = DiffusionGemmaForDLM(hf_config, config.threshold)
+            # threshold turns on the salient path; the attention approximation rides along
+            if config.threshold is not None:
+                from dyllm.model_executor.models.diffusiongemma import attention_sparse_varlen
+                if attention_sparse_varlen is not None:
+                    for layer in self.model.model.layers:
+                        layer.self_attn.diffusiongemma_sparse = True
+            self.sampler = DiffusionGemmaSampler(config.vocab_size)
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
         load_model(self.model, config.model)
@@ -364,7 +377,133 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def prepare_diffusiongemma(self, seqs: list[Sequence], modes: list[bool]):
+        """One flat batch: causal (encode) segments = rows not yet in the KV
+        caches, bidirectional (denoise) segments = canvas rows (+ self-conditioning)."""
+        input_parts, positions, cu_seqlens, context_lens, seq_ids = [], [], [0], [], []
+        self_conditioning_parts, full_parts, denoise_rows = [], [], []
+        max_seqlen = 0
+        hidden = self.config.hidden_size
+        dtype = self.model.model.embed_tokens.weight.dtype
+        metadata = get_metadata()
+        threshold = self.config.threshold
+        has_self_conditioning = False
+        canvas_len = self.config.canvas_length
+        kv_cache_caps = [seq.num_prompt_tokens + seq.max_new_tokens + canvas_len for seq in seqs]
+        dev = "cuda"
+        for seq, causal in zip(seqs, modes):
+            if causal:
+                start = seq.encoded_len
+                rows = seq.token_ids[start:]
+                seqlen = len(rows)
+                input_parts.append(torch.tensor(rows, dtype=torch.int64, device=dev))
+                positions.extend(range(start, len(seq)))
+                denoise_rows.append(torch.zeros(seqlen, dtype=torch.bool, device=dev))
+                if threshold is not None:
+                    full_parts.append(torch.zeros(seqlen, dtype=torch.bool, device=dev))
+                self_conditioning_parts.append(torch.zeros(seqlen, hidden, dtype=dtype, device=dev))
+            else:
+                canvas = seq.canvas
+                if threshold is not None:
+                    full_parts.append(torch.full((canvas.numel(),), seq.canvas_step <= _FULL_STEPS,
+                                                 dtype=torch.bool, device=canvas.device))
+                seqlen = canvas.numel()
+                input_parts.append(canvas)
+                positions.extend(range(len(seq), len(seq) + seqlen))
+                denoise_rows.append(torch.ones(seqlen, dtype=torch.bool, device=dev))
+                if seq.self_conditioning is not None:
+                    has_self_conditioning = True
+                    self_conditioning_parts.append(seq.self_conditioning)
+                else:
+                    self_conditioning_parts.append(torch.zeros(canvas.numel(), hidden, dtype=dtype, device=canvas.device))
+            cu_seqlens.append(cu_seqlens[-1] + seqlen)
+            context_lens.append(seqlen)
+            max_seqlen = max(seqlen, max_seqlen)
+            seq_ids.append(seq.seq_id)
+        input_ids = torch.cat(input_parts).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_gpu = torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_gpu = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        z = torch.cat(self_conditioning_parts).cuda(non_blocking=True) if has_self_conditioning else None
+        metadata.running_seqs = seq_ids
+        metadata.running_seqs_tensor = torch.tensor(seq_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        any_causal, any_denoise = any(modes), not all(modes)
+        attn_mode = "causal" if not any_denoise else ("denoise" if not any_causal else "mixed")
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_gpu,
+            cu_seqlens_q_cpu=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_gpu,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            context_lens=context_lens_gpu,
+            context_lens_cpu=context_lens,
+            total_seqlen=cu_seqlens[-1],
+            attn_mode=attn_mode,
+            self_conditioning=z,
+            step_cache={},
+            kv_cache_caps=kv_cache_caps,
+            canvas_len=canvas_len,
+            full_rows=torch.cat(full_parts) if full_parts else None,
+            modes=list(modes),
+            denoise_rows=torch.cat(denoise_rows),
+        )
+        return input_ids, positions
+
+    @torch.inference_mode()
+    def run_diffusiongemma(self, seqs: list[Sequence], modes: list[bool]):
+        input_ids, positions = self.prepare_diffusiongemma(seqs, modes)
+        hidden = self.model(input_ids, positions)
+        ctx = get_context()
+        result = {"encoded": [seq.seq_id for seq, m in zip(seqs, modes) if m]}
+        den_seqs = [seq for seq, m in zip(seqs, modes) if not m]
+        if den_seqs and self.rank == 0:
+            hidden_d = hidden if all(not m for m in modes) else hidden[ctx.denoise_rows]
+            result.update(self.sample_diffusiongemma(den_seqs, hidden_d))
+            result["denoise_seqs"] = den_seqs
+        reset_context()
+        return result
+
+    def sample_diffusiongemma(self, seqs: list[Sequence], hidden: torch.Tensor):
+        L = self.config.canvas_length
+        canvas_hidden = hidden
+        B = len(seqs)
+        device = canvas_hidden.device
+        canvas = torch.stack([seq.canvas for seq in seqs]).to(device)
+        history = torch.stack([seq.canvas_history for seq in seqs], dim=1).to(device)
+        stability_threshold = seqs[0].stability_threshold
+        assert all(seq.stability_threshold == stability_threshold for seq in seqs)
+
+        def per_seq(name, dtype=torch.float32):
+            return torch.tensor([float(getattr(seq, name)) for seq in seqs], dtype=dtype, device=device)
+
+        softcap = self.model.final_logit_softcapping
+
+        cur_steps = torch.tensor([float(seq.cur_step) for seq in seqs], dtype=torch.float64, device=device)
+        t_min, t_max = per_seq("t_min", torch.float64), per_seq("t_max", torch.float64)
+        max_steps = per_seq("max_denoising_steps", torch.float64)
+        entropy_bound, conv_thr = per_seq("entropy_bound"), per_seq("convergence_threshold")
+
+        # deterministic canvas update: argmax input tokens, no re-noise
+        canvas_logits = self.model.lm_logits(canvas_hidden).view(B, L, -1)  # raw; softcap in the sampler
+        argmax, entropy, processed = self.sampler.stats(canvas_logits, cur_steps, t_min, t_max, max_steps, softcap)
+        canvas_logits = None
+        new_canvas, _ = self.sampler.accept_from_entropy(canvas, argmax, entropy, entropy_bound)
+        stop, history, converged = self.sampler.check_stop_from_entropy(
+            argmax, entropy, history, conv_thr, stability_threshold
+        )
+        z = self.model.soft_embed(processed).view(B, L, -1)
+        return {
+            "canvas": new_canvas,
+            "argmax": argmax,
+            "stop": stop,
+            "history": history,
+            "self_conditioning": z,
+        }
+
     def run(self, seqs: list[Sequence], is_full: bool) -> list[int]:
+        if self.is_diffusiongemma:
+            return self.run_diffusiongemma(seqs, is_full)
         input_ids, positions = self.prepare_full(seqs) if is_full else self.prepare_sparse(seqs)
 
         logits = self.run_model(input_ids, positions, is_full)

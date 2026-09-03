@@ -19,7 +19,7 @@ from dyllm.utils.metadata import set_metadata, get_metadata
 
 class DLLMEngine:
     def __init__(self, model, threshold, **kwargs):
-        config = Config(model)
+        config = Config(model, **kwargs)
         env_dist_port = os.environ.get("DYLLM_DIST_PORT")
         if env_dist_port is not None:
             config.dist_port = int(env_dist_port)
@@ -44,6 +44,8 @@ class DLLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.mask = config.mask_id
         self.scheduler = Scheduler(config)
+        self.config = config
+        self.is_diffusiongemma = config.hf_config.model_type == "diffusion_gemma"
 
         atexit.register(self.exit)
 
@@ -198,10 +200,20 @@ class DLLMEngine:
             token_ids = self.tokenizer.encode(prompt)
         else:
             token_ids = prompt
-        token_ids += [self.mask] * sampling_params.max_new_tokens
+        if self.mask is not None:
+            token_ids += [self.mask] * sampling_params.max_new_tokens
 
         sampling_params.mask_id = self.mask
         seq = Sequence(token_ids, sampling_params)
+        if self.is_diffusiongemma:
+            # sampler params: user > checkpoint generation_config
+            for name in (
+                "entropy_bound", "t_min", "t_max", "max_denoising_steps",
+                "convergence_threshold", "stability_threshold",
+            ):
+                if getattr(seq, name) is None:
+                    setattr(seq, name, getattr(self.config, name))
+            seq.open_canvas(self.config.vocab_size, self.config.canvas_length, device="cuda")
         if seq.seq_id not in metadata.all_seqs:
             metadata.all_seqs.append(seq.seq_id)
         self.scheduler.add(seq)
@@ -211,10 +223,14 @@ class DLLMEngine:
 
     def step(self):
         seqs, is_full = self.scheduler.schedule()
-        selected_positions, selected_tokens, selected_counts = self.model_runner.call("run", seqs, is_full)
-        self.scheduler.postprocess(seqs, selected_positions, selected_tokens, selected_counts)
+        if self.is_diffusiongemma:
+            result = self.model_runner.call("run", seqs, is_full)
+            self.scheduler.postprocess_diffusiongemma(seqs, result)
+        else:
+            selected_positions, selected_tokens, selected_counts = self.model_runner.call("run", seqs, is_full)
+            self.scheduler.postprocess(seqs, selected_positions, selected_tokens, selected_counts)
         outputs = [(seq.seq_id, seq.token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_full else -len(seqs)
+        num_tokens = sum(len(seq) for seq in seqs) if (is_full is True) else -len(seqs)
         return outputs, num_tokens
 
     def generate(

@@ -12,7 +12,8 @@ def get_arch_flags():
     arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0 8.6 8.9 9.0 10.0")
     flags = []
     for arch in arch_list.split():
-        flags += [f"-gencode=arch=compute_{arch.replace('.', '')},code=sm_{arch.replace('.', '')}"]
+        num = arch.replace(".", "") + ("a" if arch == "9.0" else "")
+        flags += [f"-gencode=arch=compute_{num},code=sm_{num}"]
     return flags
 
 
@@ -67,15 +68,28 @@ ext_modules = []
 
 attn_src = "dyllm/csrc/attention"
 cutlass_includes = get_cutlass_include_dirs()
+
+attn_defines = ["-DDYLLM_D512_SECONDARY"]
+attn_sources = [
+    os.path.join(attn_src, "attention.cpp"),
+    os.path.join(attn_src, "attention_ops_kernels_sm80.cu"),
+    os.path.join(attn_src, "attention_ops_kernels_sm80_d512.cu"),
+]
+
+if any("compute_90a" in f for f in get_arch_flags()):
+    attn_sources += [
+        os.path.join(attn_src, "attention_ops_kernels_sm90.cu"),
+        os.path.join(attn_src, "attention_ops_kernels_sm90_d512.cu"),
+    ]
+else:
+    attn_defines.append("-DDYLLM_NO_H100")
+
 ext_modules.append(
     CUDAExtension(
         name="dyllm.attention_ops",
-        sources=[
-            os.path.join(attn_src, "attention.cpp"),
-            os.path.join(attn_src, "attention_ops_kernels.cu"),
-        ],
+        sources=attn_sources,
         include_dirs=[attn_src] + cutlass_includes,
-        extra_compile_args={"cxx": cxx_args, "nvcc": nvcc_args},
+        extra_compile_args={"cxx": cxx_args + attn_defines, "nvcc": nvcc_args + attn_defines},
     )
 )
 

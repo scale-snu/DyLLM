@@ -20,9 +20,9 @@ __device__ __host__ constexpr int cdiv(int a, int b) {
   return (a + b - 1) / b;
 }
 
-// NOTE: stride in bytes
+// Stride in bytes.
 template <int STRIDE> __device__ uint32_t swizzle(uint32_t index) {
-  // no need swizzling
+  // No swizzle needed.
   if constexpr (STRIDE == 16)
     return index;
 
@@ -37,8 +37,10 @@ __device__ inline void global_to_shared_swizzle_zero_pad(uint32_t dst, const nv_
   constexpr int num_elems = 16 / sizeof(nv_bfloat16);
   constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
 
+  static_assert(HEIGHT * WIDTH % (TB_SIZE * num_elems) == 0,
+                "tile must divide evenly across the threadblock (HEIGHT*WIDTH % (TB_SIZE*8) != 0)");
+
   const int kv_offset = kv_id * HEIGHT;
-  const int zero = 0x0;
 #pragma unroll
   for (int iter = 0; iter < num_iters; iter++) {
     const int idx = (iter * TB_SIZE + tid) * num_elems;
@@ -49,9 +51,7 @@ __device__ inline void global_to_shared_swizzle_zero_pad(uint32_t dst, const nv_
     const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
 
     if ((global_row < low_bound) || (global_row >= up_bound)) {
-      asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
-                   :
-                   : "r"(dst_addr), "r"(zero), "r"(zero), "r"(zero), "r"(zero));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;" : : "r"(dst_addr), "l"(src));
 
     } else {
       const nv_bfloat16* src_addr = src + (row * src_stride + col);
@@ -66,9 +66,10 @@ __device__ inline void global_to_shared_swizzle_zero_pad_with_mask(uint32_t dst,
                                                                    const int* idx_map) {
   constexpr int num_elems = 16 / sizeof(nv_bfloat16);
   constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+  static_assert(HEIGHT * WIDTH % (TB_SIZE * num_elems) == 0,
+                "tile must divide evenly across the threadblock (HEIGHT*WIDTH % (TB_SIZE*8) != 0)");
 
   const int kv_offset = kv_id * HEIGHT;
-  const int zero = 0x0;
 #pragma unroll
   for (int iter = 0; iter < num_iters; iter++) {
     const int idx = (iter * TB_SIZE + tid) * num_elems;
@@ -80,14 +81,39 @@ __device__ inline void global_to_shared_swizzle_zero_pad_with_mask(uint32_t dst,
     const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
 
     if ((idx_val == -1) || ((global_row < low_bound) || (global_row >= up_bound))) {
-      asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
-                   :
-                   : "r"(dst_addr), "r"(zero), "r"(zero), "r"(zero), "r"(zero));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;" : : "r"(dst_addr), "l"(src));
 
     } else {
       const nv_bfloat16* src_addr = src + (row * src_stride + col);
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst_addr), "l"(src_addr));
     }
+  }
+}
+
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline void global_to_shared_swizzle_zero_pad_with_row_mask(uint32_t dst, const nv_bfloat16* src,
+                                                                       int src_stride, int tid, int kv_id,
+                                                                       int low_bound, int up_bound,
+                                                                       uint64_t row_mask) {
+  constexpr int num_elems = 16 / sizeof(nv_bfloat16);
+  constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+  static_assert(HEIGHT * WIDTH % (TB_SIZE * num_elems) == 0,
+                "tile must divide evenly across the threadblock (HEIGHT*WIDTH % (TB_SIZE*8) != 0)");
+  const int kv_offset = kv_id * HEIGHT;
+
+#pragma unroll
+  for (int iter = 0; iter < num_iters; iter++) {
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % WIDTH;
+    const int global_row = kv_offset + row;
+    const bool valid = global_row >= low_bound && global_row < up_bound && ((row_mask >> row) & 1ULL);
+    const int src_size = valid ? 16 : 0;
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+    const nv_bfloat16* src_addr = src + row * src_stride + col;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                 :
+                 : "r"(dst_addr), "l"(src_addr), "r"(src_size));
   }
 }
 

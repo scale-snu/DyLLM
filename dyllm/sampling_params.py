@@ -14,3 +14,10 @@ class SamplingParams:
     top_k: int = None
     confidence_threshold: float = None
     input_len: int = None
+    # --- everything below is DiffusionGemma-only (the mask-based models ignore it) ---
+    entropy_bound: float = None
+    t_max: float = None
+    t_min: float = None
+    max_denoising_steps: int = None
+    convergence_threshold: float = None
+    stability_threshold: int = None
