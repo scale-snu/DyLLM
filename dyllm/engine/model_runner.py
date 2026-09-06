@@ -14,6 +14,7 @@ from dyllm.model_executor.layers.sampler import LLaDASampler, DreamSampler, Diff
 from dyllm.utils.context import set_context, get_context, reset_context
 from dyllm.utils.weight_loader import load_model
 from dyllm.utils.metadata import get_metadata
+from dyllm.distributed import initialize_parallel_state
 
 _FULL_STEPS = 2  # first denoise steps of a canvas run dense
 
@@ -27,14 +28,25 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.num_full_forwards = 0
+        self.num_sparse_forwards = 0
+
+        # Pin this process before NCCL creates communicators.  Initializing NCCL
+        # first makes barrier guess a device and can deadlock on heterogeneous
+        # rank-to-device mappings.
+        torch.cuda.set_device(rank)
 
         # Initialize distributed process group.
         port = config.dist_port if config.dist_port is not None else int(os.environ.get("DYLLM_DIST_PORT", "29500"))
         dist.init_process_group(
-            backend="nccl", init_method=f"tcp://localhost:{port}", world_size=self.world_size, rank=rank
+            backend="nccl",
+            init_method=f"tcp://localhost:{port}",
+            world_size=self.world_size,
+            rank=rank,
+            device_id=torch.device(f"cuda:{rank}"),
         )
+        initialize_parallel_state(config.expert_parallel_size)
 
-        torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(getattr(torch, getattr(config, "dtype", "bfloat16")))
         torch.set_default_device("cuda")
@@ -55,10 +67,11 @@ class ModelRunner:
             # threshold turns on the salient path; the attention approximation rides along
             if config.threshold is not None:
                 from dyllm.model_executor.models.diffusiongemma import attention_sparse_varlen
+
                 if attention_sparse_varlen is not None:
                     for layer in self.model.model.layers:
                         layer.self_attn.diffusiongemma_sparse = True
-            self.sampler = DiffusionGemmaSampler(config.vocab_size)
+            self.sampler = DiffusionGemmaSampler(config.diffusiongemma.vocab_size)
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
         load_model(self.model, config.model)
@@ -68,12 +81,14 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
+            if not config.shm_name:
+                raise RuntimeError("A unique shared-memory name is required for tensor parallelism")
             if rank == 0:
-                self.shm = SharedMemory(name="dyllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="dyllm")
+                self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def exit(self):
@@ -106,6 +121,11 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise ValueError(
+                f"Tensor-parallel command is {n + 4} bytes, larger than the "
+                f"shared-memory transport ({len(self.shm.buf)} bytes)"
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4 : n + 4] = data
         for event in self.event:
@@ -185,19 +205,13 @@ class ModelRunner:
             seqlen_q = seq.max_new_tokens
             cu_promptlens.append(seq.num_prompt_tokens + cu_promptlens[-1])
             answer_start = seqlen - seq.max_new_tokens
-            kept = [
-                (p, t)
-                for p, t in zip(seq.last_token_pos, seq.last_tokens)
-                if p >= answer_start
-            ]
+            kept = [(p, t) for p, t in zip(seq.last_token_pos, seq.last_tokens) if p >= answer_start]
             kept_pos = [p for p, _ in kept]
             kept_count = len(kept_pos)
             if seq.processed_steps > 4 and seq.processed_steps % 4 != 0:
                 input_ids.extend(seq[-seq.max_new_tokens :])
                 positions.extend(list(range(seqlen - seq.max_new_tokens, seqlen)))
-                idx_salient_rows.extend(
-                    [i - seq.num_prompt_tokens + cu_seqlens_q[-1] for i in kept_pos]
-                )
+                idx_salient_rows.extend([i - seq.num_prompt_tokens + cu_seqlens_q[-1] for i in kept_pos])
                 idx_salient_rows_k.extend([i + cu_seqlens_k[-1] for i in kept_pos])
                 seqlen_q = seq.max_new_tokens
             else:
@@ -336,9 +350,7 @@ class ModelRunner:
         transfers_cpu = torch.tensor(transfers, dtype=torch.int32, device="cpu").pin_memory()
         p_cpu = torch.tensor(top_ps, dtype=torch.float32, device="cpu").pin_memory() if has_p else None
         k_cpu = torch.tensor(top_ks, dtype=torch.int32, device="cpu").pin_memory() if has_k else None
-        conf_thr_cpu = (
-            torch.tensor(conf_thrs, dtype=torch.float32, device="cpu").pin_memory() if has_conf_thr else None
-        )
+        conf_thr_cpu = torch.tensor(conf_thrs, dtype=torch.float32, device="cpu").pin_memory() if has_conf_thr else None
 
         rels_cpu = torch.tensor(rels, dtype=torch.long, device="cpu").pin_memory()
         offsets_cpu = torch.tensor(batch_offsets, dtype=torch.long, device="cpu").pin_memory()
@@ -348,9 +360,7 @@ class ModelRunner:
         num_transfer_tokens = transfers_cpu.to(device="cuda", non_blocking=True)
         top_p = p_cpu.to(device="cuda", non_blocking=True) if p_cpu is not None else None
         top_k = k_cpu.to(device="cuda", non_blocking=True) if k_cpu is not None else None
-        confidence_thresholds = (
-            conf_thr_cpu.to(device="cuda", non_blocking=True) if conf_thr_cpu is not None else None
-        )
+        confidence_thresholds = conf_thr_cpu.to(device="cuda", non_blocking=True) if conf_thr_cpu is not None else None
 
         rel = rels_cpu.to(device="cuda", non_blocking=True)
         batch_offsets_gpu = offsets_cpu.to(device="cuda", non_blocking=True)
@@ -383,12 +393,12 @@ class ModelRunner:
         input_parts, positions, cu_seqlens, context_lens, seq_ids = [], [], [0], [], []
         self_conditioning_parts, full_parts, denoise_rows = [], [], []
         max_seqlen = 0
-        hidden = self.config.hidden_size
+        hidden = self.config.diffusiongemma.hidden_size
         dtype = self.model.model.embed_tokens.weight.dtype
         metadata = get_metadata()
         threshold = self.config.threshold
         has_self_conditioning = False
-        canvas_len = self.config.canvas_length
+        canvas_len = self.config.diffusiongemma.canvas_length
         kv_cache_caps = [seq.num_prompt_tokens + seq.max_new_tokens + canvas_len for seq in seqs]
         dev = "cuda"
         for seq, causal in zip(seqs, modes):
@@ -405,8 +415,11 @@ class ModelRunner:
             else:
                 canvas = seq.canvas
                 if threshold is not None:
-                    full_parts.append(torch.full((canvas.numel(),), seq.canvas_step <= _FULL_STEPS,
-                                                 dtype=torch.bool, device=canvas.device))
+                    full_parts.append(
+                        torch.full(
+                            (canvas.numel(),), seq.canvas_step <= _FULL_STEPS, dtype=torch.bool, device=canvas.device
+                        )
+                    )
                 seqlen = canvas.numel()
                 input_parts.append(canvas)
                 positions.extend(range(len(seq), len(seq) + seqlen))
@@ -415,7 +428,9 @@ class ModelRunner:
                     has_self_conditioning = True
                     self_conditioning_parts.append(seq.self_conditioning)
                 else:
-                    self_conditioning_parts.append(torch.zeros(canvas.numel(), hidden, dtype=dtype, device=canvas.device))
+                    self_conditioning_parts.append(
+                        torch.zeros(canvas.numel(), hidden, dtype=dtype, device=canvas.device)
+                    )
             cu_seqlens.append(cu_seqlens[-1] + seqlen)
             context_lens.append(seqlen)
             max_seqlen = max(seqlen, max_seqlen)
@@ -465,7 +480,7 @@ class ModelRunner:
         return result
 
     def sample_diffusiongemma(self, seqs: list[Sequence], hidden: torch.Tensor):
-        L = self.config.canvas_length
+        L = self.config.diffusiongemma.canvas_length
         canvas_hidden = hidden
         B = len(seqs)
         device = canvas_hidden.device
@@ -501,7 +516,15 @@ class ModelRunner:
             "self_conditioning": z,
         }
 
-    def run(self, seqs: list[Sequence], is_full: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_full: bool, finished_seqs: list[int] | None = None) -> list[int]:
+        if self.rank == 0:
+            if is_full:
+                self.num_full_forwards += 1
+            else:
+                self.num_sparse_forwards += 1
+        # Child ranks do not run Scheduler.postprocess, so rank 0 must propagate
+        # the cache entries that became dead after the preceding engine step.
+        get_metadata().finished_seqs = list(finished_seqs or [])
         if self.is_diffusiongemma:
             return self.run_diffusiongemma(seqs, is_full)
         input_ids, positions = self.prepare_full(seqs) if is_full else self.prepare_sparse(seqs)

@@ -1,9 +1,6 @@
 import atexit
-import torch
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 import os
-from time import perf_counter_ns
 import threading
 import queue
 import time
@@ -13,13 +10,23 @@ from dyllm.config import Config
 from dyllm.engine.model_runner import ModelRunner
 from dyllm.engine.sequence import Sequence
 from dyllm.engine.scheduler import Scheduler
+from dyllm.engine.diffusiongemma import (
+    DiffusionGemmaScheduler,
+    DiffusionGemmaSequence,
+)
 from dyllm.sampling_params import SamplingParams
-from dyllm.utils.metadata import set_metadata, get_metadata
+from dyllm.utils.metadata import get_metadata
+from dyllm.utils.transformers_compat import load_tokenizer
 
 
 class DLLMEngine:
     def __init__(self, model, threshold, **kwargs):
         config = Config(model, **kwargs)
+        config.threshold = threshold
+        self.config = config
+        self.is_diffusiongemma = config.hf_config.model_type == "diffusion_gemma"
+        self._sequence_device = "cuda"
+        self._closed = False
         env_dist_port = os.environ.get("DYLLM_DIST_PORT")
         if env_dist_port is not None:
             config.dist_port = int(env_dist_port)
@@ -27,7 +34,18 @@ class DLLMEngine:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
                 config.dist_port = s.getsockname()[1]
+        if config.tensor_parallel_size > 1:
+            config.shm_name = f"dyllm-{os.getpid()}-{config.dist_port}"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        self.tokenizer = load_tokenizer(
+            config.model,
+            use_fast=True,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        config.eos = self.tokenizer.eos_token_id
+        self.mask = config.mask_id
+
         ctx = mp.get_context("spawn")
         self.ps = []
         self.events = []
@@ -38,14 +56,16 @@ class DLLMEngine:
             self.ps.append(process)
             self.events.append(event)
 
-        config.threshold = threshold
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True, trust_remote_code=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.mask = config.mask_id
-        self.scheduler = Scheduler(config)
-        self.config = config
-        self.is_diffusiongemma = config.hf_config.model_type == "diffusion_gemma"
+        try:
+            self.model_runner = ModelRunner(config, 0, self.events)
+        except BaseException:
+            for process in self.ps:
+                if process.is_alive():
+                    process.terminate()
+                process.join()
+            raise
+        scheduler_cls = DiffusionGemmaScheduler if self.is_diffusiongemma else Scheduler
+        self.scheduler = scheduler_cls(config)
 
         atexit.register(self.exit)
 
@@ -55,11 +75,16 @@ class DLLMEngine:
         self._worker: threading.Thread | None = None
 
     def exit(self):
-        self.model_runner.call("exit")
+        if self._closed:
+            return
+        self._closed = True
         self.stop_async()
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.call("exit")
+            del self.model_runner
+        for process in getattr(self, "ps", []):
+            process.join()
 
     def start_async(self):
         """Start background worker; safe to call multiple times."""
@@ -88,19 +113,7 @@ class DLLMEngine:
         if self._worker is None:
             raise RuntimeError("Async worker not started")
 
-        if isinstance(prompt, str):
-            token_ids = self.tokenizer.encode(prompt)
-        else:
-            token_ids = prompt
-
-        if sampling_params.input_len is not None:
-            if len(token_ids) > sampling_params.input_len:
-                token_ids = token_ids[: sampling_params.input_len]
-            else:
-                token_ids += [token_ids[-1]] * (sampling_params.input_len - len(token_ids))
-
-        sampling_params.mask_id = self.mask
-        seq = Sequence(token_ids, sampling_params)
+        seq = self._create_sequence(prompt, sampling_params)
 
         self._in_q.put(seq)
         return seq.seq_id
@@ -196,38 +209,56 @@ class DLLMEngine:
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         metadata = get_metadata()
-        if isinstance(prompt, str):
-            token_ids = self.tokenizer.encode(prompt)
-        else:
-            token_ids = prompt
-        if self.mask is not None:
-            token_ids += [self.mask] * sampling_params.max_new_tokens
-
-        sampling_params.mask_id = self.mask
-        seq = Sequence(token_ids, sampling_params)
-        if self.is_diffusiongemma:
-            # sampler params: user > checkpoint generation_config
-            for name in (
-                "entropy_bound", "t_min", "t_max", "max_denoising_steps",
-                "convergence_threshold", "stability_threshold",
-            ):
-                if getattr(seq, name) is None:
-                    setattr(seq, name, getattr(self.config, name))
-            seq.open_canvas(self.config.vocab_size, self.config.canvas_length, device="cuda")
+        seq = self._create_sequence(prompt, sampling_params)
         if seq.seq_id not in metadata.all_seqs:
             metadata.all_seqs.append(seq.seq_id)
         self.scheduler.add(seq)
 
+    def _create_sequence(self, prompt: str | list[int], sampling_params: SamplingParams) -> Sequence:
+        if isinstance(prompt, str):
+            token_ids = self.tokenizer.encode(prompt)
+        else:
+            token_ids = list(prompt)
+        if sampling_params.input_len is not None:
+            if not token_ids:
+                raise ValueError("input_len cannot be applied to an empty prompt")
+            if len(token_ids) > sampling_params.input_len:
+                token_ids = token_ids[: sampling_params.input_len]
+            else:
+                token_ids += [token_ids[-1]] * (sampling_params.input_len - len(token_ids))
+        if self.mask is not None:
+            token_ids += [self.mask] * sampling_params.max_new_tokens
+
+        sampling_params.mask_id = self.mask
+        if self.is_diffusiongemma:
+            return DiffusionGemmaSequence(
+                token_ids,
+                sampling_params,
+                self.config.diffusiongemma,
+                device=self._sequence_device,
+            )
+        return Sequence(token_ids, sampling_params)
+
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    @property
+    def execution_stats(self) -> dict[str, int]:
+        return {
+            "full_forwards": self.model_runner.num_full_forwards,
+            "sparse_forwards": self.model_runner.num_sparse_forwards,
+        }
+
     def step(self):
         seqs, is_full = self.scheduler.schedule()
+        finished_seqs = list(get_metadata().finished_seqs)
         if self.is_diffusiongemma:
-            result = self.model_runner.call("run", seqs, is_full)
-            self.scheduler.postprocess_diffusiongemma(seqs, result)
+            result = self.model_runner.call("run", seqs, is_full, finished_seqs)
+            self.scheduler.postprocess(seqs, result)
         else:
-            selected_positions, selected_tokens, selected_counts = self.model_runner.call("run", seqs, is_full)
+            selected_positions, selected_tokens, selected_counts = self.model_runner.call(
+                "run", seqs, is_full, finished_seqs
+            )
             self.scheduler.postprocess(seqs, selected_positions, selected_tokens, selected_counts)
         outputs = [(seq.seq_id, seq.token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if (is_full is True) else -len(seqs)
@@ -245,15 +276,10 @@ class DLLMEngine:
             self.add_request(prompt, sp)
 
         outputs = {}
-        start = time.perf_counter_ns()
         while not self.is_finished():
-            t = perf_counter_ns()
-            output, num_tokens = self.step()
+            output, _ = self.step()
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
-        end = time.perf_counter_ns()
-
-        # print(f"Total generation time: {(end - start) / 1e9:.2f} s")
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         if len(token_ids[-sampling_params[0].max_new_tokens :]) == 0:

@@ -19,14 +19,6 @@ class Scheduler:
         self.sparse: deque[Sequence] = deque()
         self.prune: deque[Sequence] = deque()
         self.finished: List[int] = []
-        self.canvas_length = config.canvas_length
-        self.is_diffusiongemma = config.hf_config.model_type == "diffusion_gemma"
-        if self.is_diffusiongemma:
-            self.vocab_size = config.vocab_size
-            self.eos_ids = config.eos_ids
-            self.pad_id = config.pad_id if config.pad_id is not None else 0
-            self.num_rounds = 0
-            self.num_canvas_steps = 0
 
     def is_finished(self):
         return not self.full and not self.sparse
@@ -34,9 +26,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.full.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool | list[bool]]:
-        if self.is_diffusiongemma:
-            return self.schedule_diffusiongemma()
+    def schedule(self) -> tuple[list[Sequence], bool]:
         # full: stays in full list until it goes through enough numbers of full steps
         scheduled_seqs = []
         seen = []
@@ -83,31 +73,6 @@ class Scheduler:
         assert scheduled_seqs
         self.sparse.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
-
-    def schedule_diffusiongemma(self) -> tuple[list[Sequence], list[bool]]:
-        # mixed batch: seqs awaiting their encode pass ride as causal segments, the rest as bidirectional
-        scheduled_seqs, modes = [], []
-        num_tokens = 0
-        for seq in self.full:
-            if len(scheduled_seqs) >= self.max_num_seqs:
-                break
-            if seq.needs_encode:
-                rows = len(seq) - seq.encoded_len
-                causal = True
-            else:
-                rows = self.canvas_length
-                causal = False
-            if num_tokens + rows > self.max_num_batched_tokens:
-                break
-            if not causal:
-                seq.processed_steps += 1  # denoise steps only -- cur_step depends on it
-            scheduled_seqs.append(seq)
-            modes.append(causal)
-            num_tokens += rows
-        assert scheduled_seqs
-        self.num_rounds += 1
-        self.num_canvas_steps += sum(1 for m in modes if not m)
-        return scheduled_seqs, modes
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.FULL
@@ -176,33 +141,5 @@ class Scheduler:
                     if seq in self.sparse:
                         self.sparse.remove(seq)
 
-        metadata = get_metadata()
-        metadata.finished_seqs = finished
-
-    def postprocess_diffusiongemma(self, seqs: list[Sequence], result: dict):
-        for sid in result.get("encoded", []):
-            for seq in seqs:
-                if seq.seq_id == sid:
-                    seq.mark_encoded()
-        den = result.get("denoise_seqs")
-        if not den:
-            get_metadata().finished_seqs = []
-            return
-        seqs = den
-        finished = []
-        canvas, argmax = result["canvas"], result["argmax"]
-        stop, history, z = result["stop"].tolist(), result["history"], result["self_conditioning"]
-        for b, seq in enumerate(seqs):
-            last_step = seq.cur_step == 1
-            seq.apply_step(canvas[b], argmax[b], history[:, b], z[b])
-            if stop[b] or last_step:
-                done = seq.commit_canvas(self.eos_ids, self.pad_id) and not seq.ignore_eos
-                if done or seq.num_completion_tokens >= seq.max_new_tokens:
-                    seq.status = SequenceStatus.FINISHED
-                    finished.append(seq.seq_id)
-                    if seq in self.full:
-                        self.full.remove(seq)
-                else:
-                    seq.open_canvas(self.vocab_size, self.canvas_length, device=canvas.device)
         metadata = get_metadata()
         metadata.finished_seqs = finished

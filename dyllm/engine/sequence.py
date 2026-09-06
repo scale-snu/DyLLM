@@ -1,4 +1,3 @@
-import torch
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -38,21 +37,6 @@ class Sequence:
 
         self.block_size = sampling_params.block_size
         self.block_idx = 0
-
-        # DiffusionGemma per-request sampling params (None for mask-based models)
-        self.entropy_bound = sampling_params.entropy_bound
-        self.t_min = sampling_params.t_min
-        self.t_max = sampling_params.t_max
-        self.max_denoising_steps = sampling_params.max_denoising_steps
-        self.convergence_threshold = sampling_params.convergence_threshold
-        self.stability_threshold = sampling_params.stability_threshold
-        # DiffusionGemma canvas state
-        self.canvas = None
-        self.canvas_argmax = None
-        self.canvas_history = None
-        self.self_conditioning = None
-        self.canvas_start_step = 0
-        self.encoded_len = 0  # rows already written to the prefix KV cache
 
     def __len__(self):
         return len(self.token_ids)
@@ -96,67 +80,3 @@ class Sequence:
     def update_block_idx(self):
         if self.num_completion_tokens > 0 and self.block_size > 0:
             self.block_idx = (self.num_completion_tokens) // self.block_size
-
-    @property
-    def cur_step(self):
-        # remaining denoising steps incl. current; valid only after schedule() increments
-        return self.max_denoising_steps - (self.processed_steps - self.canvas_start_step) + 1
-
-    @property
-    def canvas_step(self):
-        # 1-based denoise step index within the current canvas
-        return self.processed_steps - self.canvas_start_step
-
-    @property
-    def needs_encode(self):
-        # prompt or freshly committed canvas awaits its encode pass
-        return self.encoded_len < len(self.token_ids)
-
-    def mark_encoded(self):
-        self.encoded_len = len(self.token_ids)
-
-    def open_canvas(self, vocab_size: int, canvas_length: int, device="cpu"):
-        # cpu randint keeps the standalone-loop RNG contract; the engine passes cuda
-        self.canvas = torch.randint(0, vocab_size, (1, canvas_length))[0].to(device)
-        self.canvas_argmax = self.canvas.clone()
-        self.canvas_history = torch.full((self.stability_threshold, canvas_length), -1, dtype=torch.long, device=device)
-        self.self_conditioning = None
-        self.canvas_start_step = self.processed_steps
-
-    def apply_step(self, canvas, argmax, history: torch.Tensor, self_conditioning: torch.Tensor):
-        self.canvas = canvas
-        self.canvas_argmax = argmax
-        self.canvas_history = history
-        self.self_conditioning = self_conditioning
-
-    def commit_canvas(self, eos_ids, pad_id: int) -> bool:
-        # first eos kept, the rest becomes pad
-        argmax = self.canvas_argmax
-        tokens = argmax.tolist() if torch.is_tensor(argmax) else list(argmax)
-        finished = False
-        for i, t in enumerate(tokens):
-            if t in eos_ids:
-                tokens[i + 1 :] = [pad_id] * (len(tokens) - i - 1)
-                finished = True
-                break
-        self.token_ids.extend(tokens)
-        self.num_tokens += len(tokens)
-        self.canvas = None
-        self.canvas_argmax = None
-        self.canvas_history = None
-        self.self_conditioning = None
-        return finished
-
-    def __getstate__(self):
-        return (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_tokens,
-        )
-
-    def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_tokens = state[-1]

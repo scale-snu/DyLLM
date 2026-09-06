@@ -21,3 +21,4 @@ class SamplingParams:
     max_denoising_steps: int = None
     convergence_threshold: float = None
     stability_threshold: int = None
+    mask_id: int = None
