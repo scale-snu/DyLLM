@@ -10,6 +10,8 @@ BATCH_SIZE=16
 MAX_NEW_TOKENS=256
 NUM_SHOT=5
 NUM_FULL_STEPS=4
+TP_SIZE=2
+EP_SIZE=1
 
 # Sweep values
 NUM_STEPS_LIST=(256)
@@ -21,7 +23,7 @@ for steps in "${NUM_STEPS_LIST[@]}"; do
     for thr in "${THRESHOLD_LIST[@]}"; do
         for bs in "${BLOCK_SIZE[@]}"; do
         
-            OUTFILE="llada_${TASK}_${steps}_${tps}_${thr}_bs${bs}"
+            OUTFILE="llada_${TASK}_${steps}_${thr}_bs${bs}_tp${TP_SIZE}_ep${EP_SIZE}"
         
             echo "Running: num_steps=$steps threshold=$thr block_size=$bs"
             echo "Output: $OUTFILE"
@@ -34,9 +36,12 @@ for steps in "${NUM_STEPS_LIST[@]}"; do
                 --num-shot $NUM_SHOT \
                 --num-steps $steps \
                 --num-full-steps $NUM_FULL_STEPS \
+                --tp-size $TP_SIZE \
+                --ep-size $EP_SIZE \
                 --threshold $thr \
                 --output-file $OUTFILE \
                 --log-samples \
+                --limit 256 \
                 --block-size $bs 
 
             echo "Finished: $OUTFILE"

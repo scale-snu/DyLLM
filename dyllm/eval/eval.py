@@ -4,7 +4,7 @@ import torch
 import os
 import logging
 from lm_eval.evaluator import simple_evaluate
-from dyllm.eval.adapter import DyLLMAdapter, DiffusionGemmaAdapter
+from dyllm.eval.adapter import DyLLMAdapter, DiffusionGemmaAdapter  # noqa: F401
 
 
 def _is_ruler_task(task_name: str) -> bool:
@@ -43,13 +43,24 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--num-shot", type=int, default=5)
     ap.add_argument("--tp-size", type=int, default=1)
+    ap.add_argument(
+        "--ep-size",
+        type=int,
+        default=1,
+        help="MoE expert parallel size; use 1 or the same value as --tp-size",
+    )
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--ignore-eos", action="store_true", default=False)
     ap.add_argument("--num-steps", type=int, default=256)
     ap.add_argument("--num-full-steps", type=int, default=8)
     ap.add_argument("--block-size", type=int, default=32)
-    ap.add_argument("--threshold", type=float, default=None, help="salient cos threshold; default per model: LLaDA/Dream 0.99, DiffusionGemma dense")
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="salient cos threshold; default per model: LLaDA/Dream 0.99, DiffusionGemma dense",
+    )
     ap.add_argument("--trust-remote-code", action="store_true", default=True)
     ap.add_argument("--output-file", type=str, default=None)
     ap.add_argument("--log-samples", action="store_true", default=False)
@@ -95,8 +106,16 @@ def main():
 
     if args.model == "dyllm_diffusiongemma":
         # DiffusionGemma sampler settings come from the checkpoint generation_config
-        for flag, default in (("num_steps", 256), ("num_full_steps", 8), ("block_size", 32),
-                              ("tp_size", 1), ("temperature", 0.0), ("top_p", None), ("ignore_eos", False)):
+        for flag, default in (
+            ("num_steps", 256),
+            ("num_full_steps", 8),
+            ("block_size", 32),
+            ("tp_size", 1),
+            ("ep_size", 1),
+            ("temperature", 0.0),
+            ("top_p", None),
+            ("ignore_eos", False),
+        ):
             if getattr(args, flag) != default:
                 print(f"Ignoring --{flag.replace('_', '-')} for dyllm_diffusiongemma.")
         model_args_dict = {
@@ -112,6 +131,7 @@ def main():
             "model_path": args.model_path,
             "max_new_toks": args.max_new_tokens,
             "tensor_parallel_size": args.tp_size,
+            "expert_parallel_size": args.ep_size,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,

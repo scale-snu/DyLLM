@@ -1,18 +1,15 @@
 from __future__ import annotations
-from typing import List, Iterable, Tuple
-import itertools
-import re
+from typing import List
 import time
 
 import torch
 from lm_eval.api.model import LM
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
-from transformers import AutoTokenizer
 
-from dyllm.config import Config
 from dyllm.dllm import dLLM
 from dyllm.sampling_params import SamplingParams
+from dyllm.utils.transformers_compat import load_tokenizer
 
 
 def _cut_on_first_stop(text: str, stops: list[str]) -> str:
@@ -34,6 +31,7 @@ class DyLLMAdapter(LM):
         batch_size: int = 1,
         max_new_toks: int = 256,
         tensor_parallel_size: int = 1,
+        expert_parallel_size: int = 1,
         temperature: float = 0.0,
         top_p: float = 1.0,
         ignore_eos: bool = False,
@@ -64,7 +62,7 @@ class DyLLMAdapter(LM):
         self.model_path = model_path
 
         # Tokenizer (CPU)
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = load_tokenizer(
             model_path, trust_remote_code=trust_remote_code, local_files_only=True, use_fast=True
         )
 
@@ -74,6 +72,7 @@ class DyLLMAdapter(LM):
             threshold=threshold,
             enforce_eager=True,
             tensor_parallel_size=tensor_parallel_size,
+            expert_parallel_size=expert_parallel_size,
         )
         self.is_instruct = "instruct" in model_path.lower()
 
@@ -198,9 +197,7 @@ THOUGHT_CLOSE_CANDIDATES = ("<channel|>",)
 def build_prompt(tokenizer, user_prompt: str, thinking: bool = False) -> str:
     # enable_thinking is handled by the chat template itself (injects <|think|>)
     messages = [{"role": "user", "content": user_prompt}]
-    return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
-    )
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
 
 
 def resolve_thought_ids(tokenizer):
@@ -251,7 +248,7 @@ class DiffusionGemmaAdapter(LM):
         self.thinking = str(thinking).lower() in ("1", "true", "yes")
         self.model_path = model_path
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = load_tokenizer(
             model_path, trust_remote_code=trust_remote_code, local_files_only=True, use_fast=True
         )
         self.engine = dLLM(
@@ -341,11 +338,15 @@ class DiffusionGemmaAdapter(LM):
         if self._gen_time > 0:
             # non-pad count excludes the canvas tail after EOS (the paper's "tokens generated")
             nonpad = sum(self.gen_token_counts)
-            print(f"[dyllm_diffusiongemma] {self._gen_tokens} tokens ({nonpad} non-pad) in {self._gen_time:.1f}s "
-                  f"-> {self._gen_tokens / self._gen_time:.1f} TPS ({nonpad / self._gen_time:.1f} non-pad TPS)")
+            print(
+                f"[dyllm_diffusiongemma] {self._gen_tokens} tokens ({nonpad} non-pad) in {self._gen_time:.1f}s "
+                f"-> {self._gen_tokens / self._gen_time:.1f} TPS ({nonpad / self._gen_time:.1f} non-pad TPS)"
+            )
             canvases = max(1, self._gen_tokens / 256)
             k_minus_1 = sum(max(0, -(-t // 256) - 1) for t in self._gen_lens)
             steps = self.engine.scheduler.num_canvas_steps
-            print(f"[dyllm_diffusiongemma] steps/canvas {steps / canvases:.1f} | forwards {steps + k_minus_1} "
-                  f"| TPF {self._gen_tokens / max(1, steps + k_minus_1):.1f} | rounds {self.engine.scheduler.num_rounds}")
+            print(
+                f"[dyllm_diffusiongemma] steps/canvas {steps / canvases:.1f} | forwards {steps + k_minus_1} "
+                f"| TPF {self._gen_tokens / max(1, steps + k_minus_1):.1f} | rounds {self.engine.scheduler.num_rounds}"
+            )
         return results
