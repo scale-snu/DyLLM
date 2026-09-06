@@ -37,14 +37,20 @@ from dyllm.model_executor.layers.fused_moe import fused_experts, moe_gate
 from dyllm.engine.cache_manager import CacheManager
 from dyllm.utils.metadata import get_metadata
 from dyllm.utils.util import gather_rows_2D
+from dyllm.distributed import (
+    get_expert_parallel_group,
+    get_expert_parallel_rank,
+    get_expert_parallel_world_size,
+)
 
 
 class LLaDAMoESparseBlock(nn.Module):
     """Sparse MoE feed-forward: softmax top-k router + fused silu experts.
 
-    Expert weights are stored fused (``[E, 2*I, H]`` / ``[E, H, I]``) so a single
-    grouped-GEMM kernel serves all experts; the per-expert checkpoint tensors are
-    stacked into these parameters at load time (see ``LLaDAMoEForDLM.load_weights``).
+    Expert weights are stored fused so a single grouped-GEMM kernel serves the
+    rank-local expert shards. The per-expert checkpoint tensors are partitioned
+    and stacked into these parameters at load time (see
+    ``LLaDAMoEForDLM.load_weights``).
     """
 
     def __init__(self, config) -> None:
@@ -54,16 +60,86 @@ class LLaDAMoESparseBlock(nn.Module):
         self.renormalize = bool(getattr(config, "norm_topk_prob", False))
         H = config.hidden_size
         I = config.expert_intermediate_size
+        self.hidden_size = H
+        self.intermediate_size = I
+        self.ep_size = get_expert_parallel_world_size()
+        self.ep_rank = get_expert_parallel_rank()
+        self.expert_parallel = self.ep_size > 1
+
+        if self.expert_parallel:
+            if self.num_experts % self.ep_size != 0:
+                raise ValueError(f"num_experts ({self.num_experts}) must be divisible by EP size ({self.ep_size})")
+            self.num_local_experts = self.num_experts // self.ep_size
+            self.expert_start = self.ep_rank * self.num_local_experts
+            self.local_intermediate_size = I
+        else:
+            tp_size = dist.get_world_size()
+            if I % tp_size != 0:
+                raise ValueError(f"expert_intermediate_size ({I}) must be divisible by TP size ({tp_size})")
+            # vLLM's non-EP mode tensor-parallelizes every expert instead of
+            # replicating its complete matrices on every rank.
+            self.num_local_experts = self.num_experts
+            self.expert_start = 0
+            self.local_intermediate_size = I // tp_size
+
         self.gate = ReplicatedLinear(H, self.num_experts, bias=False)
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * I, H))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, H, I))
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_local_experts, 2 * self.local_intermediate_size, H))
+        self.down_proj = nn.Parameter(torch.empty(self.num_local_experts, H, self.local_intermediate_size))
         self.cache_update = MLPcache(H)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         topk_w, topk_i = moe_gate(x, self.gate.weight, self.top_k, renormalize=self.renormalize)
-        x = fused_experts(x, self.gate_up_proj, self.down_proj, topk_w, topk_i, activation="silu")
-        x = self.cache_update(x)
-        return x
+        if self.expert_parallel:
+            output = self._expert_parallel_forward(x, topk_w, topk_i)
+        else:
+            output = fused_experts(
+                x,
+                self.gate_up_proj,
+                self.down_proj,
+                topk_w,
+                topk_i,
+                activation="silu",
+            )
+            if dist.get_world_size() > 1:
+                dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        return self.cache_update(output)
+
+    def _expert_parallel_forward(
+        self,
+        x: torch.Tensor,
+        topk_w: torch.Tensor,
+        topk_i: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run only this rank's experts and reduce their token contributions.
+
+        Attention row-parallelism leaves ``x`` replicated on every TP rank, so
+        there is no need to all-gather or transmit input vectors first.  Each
+        EP rank selects the routed assignments owned by its contiguous expert
+        range, computes them once, and sums the partial token outputs.  This is
+        the all-reduce baseline corresponding to vLLM's linear expert placement;
+        an all-to-all backend can replace it later when sequence-parallel input
+        shards are introduced.
+        """
+
+        expert_end = self.expert_start + self.num_local_experts
+        owned = (topk_i >= self.expert_start) & (topk_i < expert_end)
+        flat_owned = owned.reshape(-1)
+        output = torch.zeros_like(x)
+        token_ids = torch.arange(x.size(0), device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)[flat_owned]
+        local_expert_ids = (topk_i.reshape(-1)[flat_owned] - self.expert_start).unsqueeze(1)
+        local_weights = topk_w.reshape(-1)[flat_owned].unsqueeze(1)
+        contributions = fused_experts(
+            x.index_select(0, token_ids),
+            self.gate_up_proj,
+            self.down_proj,
+            local_weights,
+            local_expert_ids,
+            activation="silu",
+        )
+        output.index_add_(0, token_ids, contributions)
+
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=get_expert_parallel_group())
+        return output
 
 
 class LLaDAMoEAttention(nn.Module):
@@ -141,8 +217,8 @@ class LLaDAMoEAttention(nn.Module):
             return x.view(*prefix, H, D)
 
         q = split_last(q, self.num_heads, self.head_dim)
-        k = split_last(k, self.num_heads, self.head_dim)
-        v = split_last(v, self.num_heads, self.head_dim)
+        k = split_last(k, self.num_kv_heads, self.head_dim)
+        v = split_last(v, self.num_kv_heads, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -241,7 +317,8 @@ class LLaDAMoEForDLM(nn.Module):
     @torch.no_grad()
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
-        intermediate = self.config.expert_intermediate_size
+        block = self.model.layers[0].mlp
+        local_intermediate = block.local_intermediate_size
         non_expert: list[tuple[str, torch.Tensor]] = []
 
         # Stack per-expert checkpoint tensors into the fused MoE parameters.
@@ -250,12 +327,25 @@ class LLaDAMoEForDLM(nn.Module):
                 head, tail = name.split(".mlp.experts.")
                 _eid, proj = tail.split(".", 1)
                 eid = int(_eid)
+                if block.expert_parallel:
+                    if not block.expert_start <= eid < block.expert_start + block.num_local_experts:
+                        continue
+                    local_eid = eid - block.expert_start
+                else:
+                    local_eid = eid
+
                 if proj == "gate_proj.weight":
-                    params[f"{head}.mlp.gate_up_proj"].data[eid, :intermediate].copy_(w)
+                    if not block.expert_parallel:
+                        w = w.chunk(dist.get_world_size(), dim=0)[dist.get_rank()]
+                    params[f"{head}.mlp.gate_up_proj"].data[local_eid, :local_intermediate].copy_(w)
                 elif proj == "up_proj.weight":
-                    params[f"{head}.mlp.gate_up_proj"].data[eid, intermediate:].copy_(w)
+                    if not block.expert_parallel:
+                        w = w.chunk(dist.get_world_size(), dim=0)[dist.get_rank()]
+                    params[f"{head}.mlp.gate_up_proj"].data[local_eid, local_intermediate:].copy_(w)
                 elif proj == "down_proj.weight":
-                    params[f"{head}.mlp.down_proj"].data[eid].copy_(w)
+                    if not block.expert_parallel:
+                        w = w.chunk(dist.get_world_size(), dim=1)[dist.get_rank()]
+                    params[f"{head}.mlp.down_proj"].data[local_eid].copy_(w)
                 else:
                     raise KeyError(f"Unexpected expert weight: {name}")
             else:
