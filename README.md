@@ -16,6 +16,59 @@ bash setup_env.sh
 python run.py
 ```
 
+### DiffusionGemma
+
+DiffusionGemma checkpoints are supported with Transformers 4.57.6 and newer,
+including the native DiffusionGemma implementation in Transformers 5:
+
+```python
+from dyllm import SamplingParams, dLLM
+
+model_path = "/data/models/diffusiongemma-26B-A4B-it"
+engine = dLLM(model_path, threshold=None, tensor_parallel_size=1)
+prompt = engine.tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Reply with only: OK"}],
+    tokenize=False,
+    add_generation_prompt=True,
+)
+outputs = engine.generate(
+    [prompt],
+    SamplingParams(max_new_tokens=256),
+)
+engine.exit()
+```
+
+DiffusionGemma currently supports one GPU. Set `threshold` to a cosine
+similarity threshold such as `0.99` to enable the saliency/sparse-attention
+path; use `None` for dense attention.
+
+### Tensor and expert parallelism
+
+For dense LLaDA and Dream models, `tensor_parallel_size` shards attention,
+dense MLP, embeddings, and the LM head. Sparse-attention cosine decisions are
+made from an all-reduce of three FP32 statistics per token (dot product and two
+squared norms), so TP ranks select exactly the same salient rows without
+gathering context vectors.
+
+LLaDA-MoE follows vLLM's two MoE layouts:
+
+```python
+# Every expert is tensor-parallel across the two ranks.
+engine = dLLM(model_path, threshold=0.99, tensor_parallel_size=2)
+
+# Experts are placed contiguously across the same two ranks (32 of 64 per GPU).
+engine = dLLM(
+    model_path,
+    threshold=0.99,
+    tensor_parallel_size=2,
+    expert_parallel_size=2,
+)
+```
+
+`expert_parallel_size` defaults to `1`. Since DyLLM does not yet expose a
+separate data-parallel dimension, EP is either disabled (`1`) or must equal
+`tensor_parallel_size`.
+
 ## Algorithm
 
 ![approximate attetion](assets/approximate_attention.png)
