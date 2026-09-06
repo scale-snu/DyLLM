@@ -25,6 +25,7 @@ from dyllm.model_executor.layers.layernorm import DiffusionGemmaRMSNorm
 from dyllm.model_executor.layers.rotary_embedding import DiffusionGemmaRotary
 from dyllm.model_executor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from dyllm.model_executor.layers.fused_moe import fused_experts, moe_gate
+from dyllm.distributed import tensor_parallel_cosine_mask
 from dyllm.utils.context import get_context
 from dyllm.utils.metadata import get_metadata
 from dyllm.configs import DiffusionGemmaConfig
@@ -101,9 +102,7 @@ class DiffusionGemmaAttention(nn.Module):
         self.q_proj = ColumnParallelLinear(hidden_size, num_heads * head_dim, bias=False)
         self.k_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=False)
         self.v_proj = (
-            ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=False)
-            if self.is_sliding
-            else None
+            ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=False) if self.is_sliding else None
         )
         self.o_proj = RowParallelLinear(num_heads * head_dim, hidden_size, bias=False)
 
@@ -120,9 +119,7 @@ class DiffusionGemmaAttention(nn.Module):
         q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
         k_raw = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         v_in = (
-            self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
-            if self.v_proj is not None
-            else k_raw
+            self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim) if self.v_proj is not None else k_raw
         )
 
         q = self.q_norm(q)
@@ -209,7 +206,9 @@ class DiffusionGemmaAttention(nn.Module):
         only when seqs / segment lengths / cache regions / modes change. Built on
         the CPU and moved with pinned non-blocking copies (no host sync)."""
         key = (
-            tuple(seq_ids), tuple(cu), tuple(modes),
+            tuple(seq_ids),
+            tuple(cu),
+            tuple(modes),
             tuple(self.cache_slots[s][0] for s in seq_ids),
             tuple(self.cache_slots[s][2] for s in seq_ids),
         )
@@ -252,17 +251,24 @@ class DiffusionGemmaAttention(nn.Module):
             return t.pin_memory().to(dev, non_blocking=True)
 
         prep = {
-            "key": key, "kv_lens": kv_lens, "max_kv": max(kv_lens), "packed_total": pk[-1],
+            "key": key,
+            "kv_lens": kv_lens,
+            "max_kv": max(kv_lens),
+            "packed_total": pk[-1],
             "row_seq": h2d(row_seq),
             "seg_len": h2d(seg.float()),
             "seg_end": h2d(seg_end),
             # per flat row: cache row, packed row (kernel layout), denoise flag
-            "kv_rows": h2d(kv_rows), "packed_rows": h2d(packed_rows), "den_rows": h2d(den_rows),
+            "kv_rows": h2d(kv_rows),
+            "packed_rows": h2d(packed_rows),
+            "den_rows": h2d(den_rows),
             "vd_key": (self.is_sliding, self.num_kv_heads, self.head_dim, tuple(kv_lens), tuple(cu)),
-            "bt": h2d(bt), "seqused": h2d(seqused),
+            "bt": h2d(bt),
+            "seqused": h2d(seqused),
             "causal": h2d(causal),
             "gather_idx": h2d(gather),
-            "cu_k": h2d(cu_k), "enc_rows": h2d(enc) if enc is not None else None,
+            "cu_k": h2d(cu_k),
+            "enc_rows": h2d(enc) if enc is not None else None,
         }
         self._prep_cache = prep
         return prep
@@ -277,8 +283,18 @@ class DiffusionGemmaAttention(nn.Module):
         out = torch.empty_like(q)
         window = (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, -1)
         attend_triton(
-            q, kp, vp, out, ctx.cu_seqlens_q, ctx.max_seqlen_q, prep["seqused"], prep["max_kv"],
-            prep["bt"], prep["causal"], self.scaling, window,
+            q,
+            kp,
+            vp,
+            out,
+            ctx.cu_seqlens_q,
+            ctx.max_seqlen_q,
+            prep["seqused"],
+            prep["max_kv"],
+            prep["bt"],
+            prep["causal"],
+            self.scaling,
+            window,
         )
         return out
 
@@ -302,15 +318,38 @@ class DiffusionGemmaAttention(nn.Module):
         q_sal, idx_q, idx_k, stats = self._scratch(n, dev, q.dtype)
         vd = self._vdelta_buffer(prep, q)
         # one launch: salient K/V -> cache, packed dV, compacted q / indices
-        sparse_prep(sal_i, prep["den_rows"], prep["kv_rows"], prep["packed_rows"], incl,
-                    q.contiguous(), k.contiguous(), v.contiguous(),
-                    self.key_cache, self.value_cache, vd, q_sal, idx_q, idx_k)
+        sparse_prep(
+            sal_i,
+            prep["den_rows"],
+            prep["kv_rows"],
+            prep["packed_rows"],
+            incl,
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            self.key_cache,
+            self.value_cache,
+            vd,
+            q_sal,
+            idx_q,
+            idx_k,
+        )
         kp, vp = self._cache_pages()
         window = (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, -1)
         o_sal = torch.empty_like(q_sal)
         attend_triton(
-            q_sal, kp, vp, o_sal, cu_sal, ctx.max_seqlen_q, prep["seqused"], prep["max_kv"],
-            prep["bt"], prep["causal"], self.scaling, window,
+            q_sal,
+            kp,
+            vp,
+            o_sal,
+            cu_sal,
+            ctx.max_seqlen_q,
+            prep["seqused"],
+            prep["max_kv"],
+            prep["bt"],
+            prep["causal"],
+            self.scaling,
+            window,
         )
         kgp = self.key_cache.index_select(0, prep["gather_idx"])
         c_full = ctx.ctx_cache.view(n, self.num_heads, self.head_dim)
@@ -319,8 +358,12 @@ class DiffusionGemmaAttention(nn.Module):
         cnt = int(pin[0])
         if cnt == n:
             out = o_sal
-            cos = nn.functional.cosine_similarity(out.view(n, -1).float(), c_full.view(n, -1).float(), dim=-1)
-            verdict = cos < self.diffusiongemma_sparse_threshold
+            out_fp32 = out.view(n, -1).float()
+            cached_fp32 = c_full.view(n, -1).float()
+            stats[:, 0] = (out_fp32 * cached_fp32).sum(dim=-1)
+            stats[:, 1] = out_fp32.square().sum(dim=-1)
+            stats[:, 2] = cached_fp32.square().sum(dim=-1)
+            verdict = tensor_parallel_cosine_mask(stats, self.diffusiongemma_sparse_threshold)
             if prep["enc_rows"] is not None:
                 # encode rows carry no cached context; their verdict is meaningless
                 verdict = verdict | prep["enc_rows"]
@@ -336,11 +379,20 @@ class DiffusionGemmaAttention(nn.Module):
             vd.to(torch.bfloat16).contiguous(),
             c_full.to(torch.bfloat16).contiguous(),
             o_sal[:cnt].to(torch.bfloat16).contiguous(),
-            ctx.cu_seqlens_q, prep["cu_k"],
-            ctx.max_seqlen_q, prep["max_kv"], n,
-            cu_sal, idx_q[:cnt], stats, mask,
-            float(self.diffusiongemma_sparse_threshold), True, idx_k[:cnt],
+            ctx.cu_seqlens_q,
+            prep["cu_k"],
+            ctx.max_seqlen_q,
+            prep["max_kv"],
+            n,
+            cu_sal,
+            idx_q[:cnt],
+            stats,
+            mask,
+            float(self.diffusiongemma_sparse_threshold),
+            True,
+            idx_k[:cnt],
         )
+        mask.copy_(tensor_parallel_cosine_mask(stats, self.diffusiongemma_sparse_threshold))
         if prep["enc_rows"] is not None:
             mask |= prep["enc_rows"]
         ctx.salient_rows = mask
@@ -361,10 +413,12 @@ class DiffusionGemmaAttention(nn.Module):
         key = (self.num_heads, self.head_dim, dtype, str(dev))
         buf = DiffusionGemmaAttention._scratch_shared.get(key)
         if buf is None or buf[0].size(0) < n:
-            buf = (torch.empty(n, self.num_heads, self.head_dim, dtype=dtype, device=dev),
-                   torch.empty(n, dtype=torch.int32, device=dev),
-                   torch.empty(n, dtype=torch.int32, device=dev),
-                   torch.zeros(n, 3, dtype=torch.float32, device=dev))
+            buf = (
+                torch.empty(n, self.num_heads, self.head_dim, dtype=dtype, device=dev),
+                torch.empty(n, dtype=torch.int32, device=dev),
+                torch.empty(n, dtype=torch.int32, device=dev),
+                torch.zeros(n, 3, dtype=torch.float32, device=dev),
+            )
             DiffusionGemmaAttention._scratch_shared[key] = buf
         stats = buf[3][:n]
         stats.zero_()
@@ -453,9 +507,7 @@ class DiffusionGemmaExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
         intermediate = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(config.num_experts, 2 * intermediate, config.hidden_size)
-        )
+        self.gate_up_proj = nn.Parameter(torch.empty(config.num_experts, 2 * intermediate, config.hidden_size))
         self.down_proj = nn.Parameter(torch.empty(config.num_experts, config.hidden_size, intermediate))
 
     def forward(self, x: torch.Tensor, topk_w: torch.Tensor, topk_i: torch.Tensor) -> torch.Tensor:
@@ -503,11 +555,7 @@ class DiffusionGemmaSalientCache(nn.Module):
 
     def rows(self, attn):
         ctx = get_context()
-        if (
-            self.threshold is None
-            or ctx.attn_mode not in ("denoise", "mixed")
-            or ctx.denoise_rows is None
-        ):
+        if self.threshold is None or ctx.attn_mode not in ("denoise", "mixed") or ctx.denoise_rows is None:
             return None
         context = attn._context
         key = (tuple(get_metadata().running_seqs), tuple(ctx.cu_seqlens_q_cpu))
@@ -610,9 +658,7 @@ class DiffusionGemmaDecoderLayer(nn.Module):
             if n == salient.numel():
                 idx = None
         x = residual if idx is None else residual.index_select(0, idx)
-        branch_mlp = self.post_feedforward_layernorm_1(
-            self.mlp(self.pre_feedforward_layernorm(x))
-        )
+        branch_mlp = self.post_feedforward_layernorm_1(self.mlp(self.pre_feedforward_layernorm(x)))
         topk_w, topk_i = self.router(x)
         branch_moe = self.experts(self.pre_feedforward_layernorm_2(x), topk_w, topk_i)
         branch_moe = self.post_feedforward_layernorm_2(branch_moe)

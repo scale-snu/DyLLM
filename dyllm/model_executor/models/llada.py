@@ -10,7 +10,6 @@ from dyllm.model_executor.layers.activations import SiluAndMul
 from dyllm.model_executor.layers.attention import Attention
 from dyllm.model_executor.layers.layernorm import RMSNorm
 from dyllm.model_executor.layers.linear import (
-    QKParallelLinear,
     KVParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -21,7 +20,7 @@ from dyllm.model_executor.layers.embed_head import VocabParallelEmbedding, Paral
 from dyllm.model_executor.layers.mlp_cache_manage import MLPcache
 from dyllm.engine.cache_manager import CacheManager
 from dyllm.utils.metadata import get_metadata
-from dyllm.utils.util import gather_rows_2D, scatter_update_2D
+from dyllm.utils.util import gather_rows_2D
 
 
 class LLaDAMLP(nn.Module):
@@ -69,7 +68,7 @@ class LLaDAAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = ColumnParallelLinear(hidden_size, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.q_proj = ColumnParallelLinear(hidden_size, self.total_num_heads * self.head_dim, bias=qkv_bias)
 
         self.kv_proj = KVParallelLinear(hidden_size, self.head_dim, self.total_num_kv_heads, bias=qkv_bias)
 
@@ -125,8 +124,8 @@ class LLaDAAttention(nn.Module):
             return x.view(*prefix, H, D)
 
         q = split_last(q, self.num_heads, self.head_dim)
-        k = split_last(k, self.num_heads, self.head_dim)
-        v = split_last(v, self.num_heads, self.head_dim)
+        k = split_last(k, self.num_kv_heads, self.head_dim)
+        v = split_last(v, self.num_kv_heads, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
 
