@@ -12,7 +12,6 @@ from dyllm.model_executor.layers.layernorm import RMSNorm
 from dyllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
-    QKVParallelLinear,
     KVParallelLinear,
     ColumnParallelLinear,
 )
@@ -21,7 +20,7 @@ from dyllm.model_executor.layers.embed_head import VocabParallelEmbedding, Paral
 from dyllm.model_executor.layers.mlp_cache_manage import MLPcache
 from dyllm.engine.cache_manager import CacheManager
 from dyllm.utils.metadata import get_metadata
-from dyllm.utils.util import gather_rows_2D, scatter_update_2D
+from dyllm.utils.util import gather_rows_2D
 
 
 class DreamMLP(nn.Module):
@@ -70,7 +69,7 @@ class DreamAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.threshold = threshold
 
-        self.q_proj = ColumnParallelLinear(hidden_size, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.q_proj = ColumnParallelLinear(hidden_size, self.total_num_heads * self.head_dim, bias=qkv_bias)
 
         self.kv_proj = KVParallelLinear(hidden_size, self.head_dim, self.total_num_kv_heads, bias=qkv_bias)
 

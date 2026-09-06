@@ -2,6 +2,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from dyllm.utils.context import get_context
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -63,3 +65,38 @@ def get_rope(
     assert rope_scaling is None
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb
+
+
+class DiffusionGemmaRotary(nn.Module):
+    """Rotary embedding with cos/sin computed per call (a 262K position table
+    would cost ~0.5 GB per geometry). ``partial_rotary_factor`` = proportional rope."""
+
+    def __init__(self, head_dim: int, base: float, partial_rotary_factor: float = 1.0):
+        super().__init__()
+        rope_angles = int(partial_rotary_factor * head_dim // 2)
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.int64).to(dtype=torch.float32) / head_dim)
+        )
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = torch.cat((inv_freq, torch.zeros(nope_angles, dtype=torch.float32)))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # per-step cache shared across layers
+        cache = get_context().step_cache
+        key_ = ("rope", self.inv_freq.shape[0])
+        if cache is not None and key_ in cache:
+            cos, sin = cache[key_]
+        else:
+            freqs = torch.outer(positions.float(), self.inv_freq)
+            cos = freqs.cos().unsqueeze(1)
+            sin = freqs.sin().unsqueeze(1)
+            if cache is not None:
+                cache[key_] = (cos, sin)
+        return apply_rotary_emb(query, cos, sin), apply_rotary_emb(key, cos, sin)

@@ -68,9 +68,7 @@ def moe_align_block_size(
     comp_starts = torch.cumsum(counts, 0) - counts  # [E] start in compact layout
 
     total_padded = int(padded.sum().item())
-    sorted_token_ids = torch.full(
-        (total_padded,), total_tokens, dtype=torch.int32, device=device
-    )
+    sorted_token_ids = torch.full((total_padded,), total_tokens, dtype=torch.int32, device=device)
 
     # Position of each compact-sorted element inside the padded layout.
     arange_t = torch.arange(total_tokens, device=device)
@@ -289,8 +287,9 @@ def fused_experts(
     """
     assert hidden_states.is_cuda and w1.is_cuda and w2.is_cuda
     num_tokens, H = hidden_states.shape
+    if num_tokens == 0:
+        return hidden_states.new_empty((0, H))
     E, two_i, _ = w1.shape
-    I = two_i // 2
     top_k = topk_ids.shape[1]
     T = num_tokens * top_k
     # fp32 inputs use IEEE matmul (no TF32) so results match a reference exactly.
@@ -301,7 +300,9 @@ def fused_experts(
     # GEMM 1: gate_up projection -> [T, 2I]
     inter1 = torch.empty((T, two_i), dtype=hidden_states.dtype, device=hidden_states.device)
     _invoke_gemm(
-        hidden_states, w1, inter1,
+        hidden_states,
+        w1,
+        inter1,
         topk_weights=None,
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
@@ -318,7 +319,9 @@ def fused_experts(
     # GEMM 2: down projection (fold in routing weight) -> [T, H]
     out = torch.empty((T, H), dtype=hidden_states.dtype, device=hidden_states.device)
     _invoke_gemm(
-        inter2, w2, out,
+        inter2,
+        w2,
+        out,
         topk_weights=topk_weights,
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,

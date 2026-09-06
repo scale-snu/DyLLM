@@ -1,4 +1,3 @@
-import torch
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -81,17 +80,3 @@ class Sequence:
     def update_block_idx(self):
         if self.num_completion_tokens > 0 and self.block_size > 0:
             self.block_idx = (self.num_completion_tokens) // self.block_size
-
-    def __getstate__(self):
-        return (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_tokens,
-        )
-
-    def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_tokens = state[-1]
