@@ -1,4 +1,5 @@
 #include "common.h"
+#include "attention_aux.h"
 
 #include <cuda_bf16.h>
 #include <float.h>
@@ -22,164 +23,22 @@ struct Sm80Cfg;
 template <>
 struct Sm80Cfg<64> {
   static constexpr bool QSMEM = false;
-  static constexpr int BLOCK_K = 64;
+  static constexpr int BLOCK_K = DyllmTileDefault<64>::BLOCK_K;
 };
 template <>
 struct Sm80Cfg<128> {
   static constexpr bool QSMEM = false;
-  static constexpr int BLOCK_K = 64;
+  static constexpr int BLOCK_K = DyllmTileDefault<128>::BLOCK_K;
 };
 template <>
 struct Sm80Cfg<256> {
   static constexpr bool QSMEM = true;
-  static constexpr int BLOCK_K = 32;
+  static constexpr int BLOCK_K = DyllmTileDefault<256>::BLOCK_K;
 };
 
 
 // [KV_PIPE] Replace K/V double buffering with one buffer each and pipeline them against each other.
 // This reduces smem to max(BLOCK_Q, 2*BLOCK_K)*DIM*2, allowing BLOCK_K to be doubled.
-
-struct BlockInfo {
-  __device__ BlockInfo(const int* cu_seqlens_q, const int* cu_seqlens_k, int batch_id)
-      : cu_seqlens_q_curr(cu_seqlens_q[batch_id]), cu_seqlens_q_next(cu_seqlens_q[batch_id + 1]),
-        cu_seqlens_k_curr(cu_seqlens_k[batch_id]), cu_seqlens_k_next(cu_seqlens_k[batch_id + 1]),
-        seqlen_q(cu_seqlens_q_next - cu_seqlens_q_curr), seqlen_kv(cu_seqlens_k_next - cu_seqlens_k_curr) {}
-  const int cu_seqlens_q_curr;
-  const int cu_seqlens_q_next;
-  const int cu_seqlens_k_curr;
-  const int cu_seqlens_k_next;
-  const int seqlen_q;
-  const int seqlen_kv;
-};
-
-__global__ void cosine_similarity_reduce_kernel(const float* __restrict__ stats, // [total_tokens, 3]
-                                                bool* __restrict__ out,          // [total_tokens]
-                                                const int total_tokens, const int* __restrict__ cu_seqlens_q,
-                                                const float threshold) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_tokens)
-    return;
-
-  float dot = stats[idx * 3 + 0];
-  float norm_a = stats[idx * 3 + 1];
-  float norm_b = stats[idx * 3 + 2];
-
-  float rsqrt_norm_a = rsqrtf(fmaxf(norm_a, 1e-8f));
-  float rsqrt_norm_b = rsqrtf(fmaxf(norm_b, 1e-8f));
-
-  float cos_sim = dot * rsqrt_norm_a * rsqrt_norm_b;
-  out[idx] = (cos_sim < threshold);
-}
-
-void compute_cosine_similarity(const float* stats, bool* out, const int total_tokens, const int* cu_seqlens_q,
-                               const float threshold) {
-  int threads = 256;
-  int blocks = (total_tokens + threads - 1) / threads;
-  cosine_similarity_reduce_kernel<<<blocks, threads, 0>>>(stats, out, total_tokens, cu_seqlens_q, threshold);
-}
-
-__global__ void overwrite_salient_kernel(const nv_bfloat16* __restrict__ c,
-                                          const nv_bfloat16* __restrict__ o_sal,
-                                          nv_bfloat16* __restrict__ o,
-                                          const int* __restrict__ idx_salient_row,
-                                          float* __restrict__ cosine_stats, const int vector_size) {
-  const int salient_idx = blockIdx.x;
-  const int token_idx = idx_salient_row[salient_idx];
-  const int pair_count = vector_size / 2;
-  const nv_bfloat162* old_row = reinterpret_cast<const nv_bfloat162*>(c + token_idx * vector_size);
-  const nv_bfloat162* new_row = reinterpret_cast<const nv_bfloat162*>(o_sal + salient_idx * vector_size);
-  nv_bfloat162* out_row = reinterpret_cast<nv_bfloat162*>(o + token_idx * vector_size);
-
-  float3 local = {0.0f, 0.0f, 0.0f};
-  for (int pair = threadIdx.x; pair < pair_count; pair += blockDim.x) {
-    const nv_bfloat162 old_v = old_row[pair];
-    const nv_bfloat162 new_v = new_row[pair];
-    out_row[pair] = new_v;
-    const float2 old_f = __bfloat1622float2(old_v);
-    const float2 new_f = __bfloat1622float2(new_v);
-    local.x += new_f.x * old_f.x + new_f.y * old_f.y;
-    local.y += new_f.x * new_f.x + new_f.y * new_f.y;
-    local.z += old_f.x * old_f.x + old_f.y * old_f.y;
-  }
-
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local.x += __shfl_down_sync(0xffffffff, local.x, offset);
-    local.y += __shfl_down_sync(0xffffffff, local.y, offset);
-    local.z += __shfl_down_sync(0xffffffff, local.z, offset);
-  }
-
-  __shared__ float3 warp_stats[8];
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  if (lane == 0)
-    warp_stats[warp] = local;
-  __syncthreads();
-
-  if (warp == 0) {
-    local = lane < blockDim.x / 32 ? warp_stats[lane] : make_float3(0.0f, 0.0f, 0.0f);
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      local.x += __shfl_down_sync(0xffffffff, local.x, offset);
-      local.y += __shfl_down_sync(0xffffffff, local.y, offset);
-      local.z += __shfl_down_sync(0xffffffff, local.z, offset);
-    }
-    if (lane == 0) {
-      cosine_stats[token_idx * 3 + 0] = local.x;
-      cosine_stats[token_idx * 3 + 1] = local.y;
-      cosine_stats[token_idx * 3 + 2] = local.z;
-    }
-  }
-}
-
-__global__ void compute_k_block_mask_kernel(const int* __restrict__ idx_salient_row,
-                                            const int* __restrict__ cu_salientlens,
-                                            const int* __restrict__ cu_seqlens_k, uint64_t* __restrict__ row_masks,
-                                            const int total_blocks, const int num_blk_k, const int block_k) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_blocks)
-    return;
-
-  const int batch_id = idx / num_blk_k;
-  const int block_id = idx - batch_id * num_blk_k;
-  const int seq_start = cu_seqlens_k[batch_id];
-  const int seq_end = cu_seqlens_k[batch_id + 1];
-  const int block_start = seq_start + block_id * block_k;
-  if (block_start >= seq_end) {
-    row_masks[idx] = 0;
-    return;
-  }
-  const int block_end = min(block_start + block_k, seq_end);
-
-  int left = cu_salientlens[batch_id];
-  int right = cu_salientlens[batch_id + 1];
-  while (left < right) {
-    const int mid = (left + right) >> 1;
-    if (idx_salient_row[mid] < block_start)
-      left = mid + 1;
-    else
-      right = mid;
-  }
-  uint64_t mask = 0;
-  const int salient_end = cu_salientlens[batch_id + 1];
-  while (left < salient_end && idx_salient_row[left] < block_end) {
-    mask |= 1ULL << (idx_salient_row[left] - block_start);
-    ++left;
-  }
-  row_masks[idx] = mask;
-}
-
-void compute_k_masks(const int batch_size, const int* cu_seqlens_k, const int* cu_salientlens_k,
-                     const int* idx_salient_row_k, const int num_salient_k, const int BLOCK_K, const int max_seqlen_k,
-                     uint64_t* row_masks) {
-
-  int num_blk_k = (max_seqlen_k + BLOCK_K - 1) / BLOCK_K;
-  const int total_blocks = batch_size * num_blk_k;
-  constexpr int threads = 256;
-  const int blocks = cdiv(total_blocks, threads);
-  compute_k_block_mask_kernel<<<blocks, threads>>>(idx_salient_row_k, cu_salientlens_k, cu_seqlens_k, row_masks,
-                                                   total_blocks, num_blk_k, BLOCK_K);
-}
 
 // Tile Q@K by BLOCK_K, and tile V loads and P@V by BLOCK_V (=MMA_K).
 template <int BLOCK_Q, int BLOCK_K, int BLOCK_V, int DIM, int NUM_WARPS, bool MASK_V_ROWS, int D_SPLIT = 1>
@@ -212,7 +71,7 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
   const int num_queries_per_kv = H / H_kv;
   const int kv_head_id = head_id / num_queries_per_kv;
 
-  BlockInfo binfo(cu_seqlens_q, cu_seqlens_k, batch_id);
+  DyllmBlockInfo binfo(cu_seqlens_q, cu_seqlens_k, batch_id);
 
   const int num_kv_iter = cdiv(binfo.seqlen_kv, BLOCK_K);
 
@@ -637,18 +496,21 @@ struct Sm80Tile {
   static constexpr int SMEM_SIZE =
       (Sm80Cfg<DIM>::QSMEM ? (BLOCK_Q + 2 * BLOCK_K) : (BLOCK_Q > 2 * BLOCK_K ? BLOCK_Q : 2 * BLOCK_K)) * DIM *
       static_cast<int>(sizeof(nv_bfloat16));
-  static_assert(BLOCK_K >= 16, "row_masks is allocated host-side for a 16-row block granularity");
+  static_assert(BLOCK_K >= 16 && BLOCK_K <= 64 && BLOCK_K % 16 == 0,
+                "BLOCK_K must fit one uint64 row mask and preserve MMA tiling");
 };
 
 template <int DIM>
-static void launch_for_dim(const nv_bfloat16* q_ptr, const nv_bfloat16* k_ptr, const nv_bfloat16* v_ptr,
+static void launch_attention_for_dim(const nv_bfloat16* q_ptr, const nv_bfloat16* k_ptr, const nv_bfloat16* v_ptr,
                            const nv_bfloat16* c_ptr, const nv_bfloat16* o_sal_ptr, nv_bfloat16* o_ptr, const int B,
                            const int H, const int H_kv, const int* cu_seqlens_q, const int* cu_seqlens_k,
                            const int max_seqlen_q, const int max_seqlen_k, const int num_salient,
                            const int* cu_salientlens, const int* idx_salient_row_k, uint64_t* row_masks,
                            float* cosine_stats, int force_mask_v_rows) {
   using T = Sm80Tile<DIM>;
-  compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, num_salient, T::BLOCK_K, max_seqlen_k, row_masks);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dyllm_compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, T::BLOCK_K, max_seqlen_k, row_masks,
+                        stream);
 
   const int num_blocks = B * H * cdiv(max_seqlen_q, T::BLOCK_Q);
 
@@ -685,8 +547,7 @@ void attention_sparse_varlen(const scalar_t* q,     // [sum(len_q), H_q, D]
 
   // Only BFloat16 is currently supported.
   if constexpr (!std::is_same_v<scalar_t, at::BFloat16>) {
-    std::cerr << "Only BFloat16 is supported" << std::endl;
-    exit(1);
+    TORCH_CHECK(false, "Only BFloat16 is supported");
   }
 
   const nv_bfloat16* q_ptr = reinterpret_cast<const nv_bfloat16*>(q);
@@ -697,7 +558,7 @@ void attention_sparse_varlen(const scalar_t* q,     // [sum(len_q), H_q, D]
   nv_bfloat16* o_ptr = reinterpret_cast<nv_bfloat16*>(o);
 
 #define DYLLM_SM80_LAUNCH(D)                                                                                           \
-  launch_for_dim<D>(q_ptr, k_ptr, v_ptr, c_ptr, o_sal_ptr, o_ptr, B, H, H_kv, cu_seqlens_q, cu_seqlens_k,              \
+  launch_attention_for_dim<D>(q_ptr, k_ptr, v_ptr, c_ptr, o_sal_ptr, o_ptr, B, H, H_kv, cu_seqlens_q, cu_seqlens_k,    \
                     max_seqlen_q, max_seqlen_k, num_salient, cu_salientlens, idx_salient_row_k, row_masks,             \
                     cosine_stats, force_mask_v_rows)
   bool handled = false;
@@ -719,18 +580,13 @@ void attention_sparse_varlen(const scalar_t* q,     // [sum(len_q), H_q, D]
       handled = true;
     }
   }
-  if (!handled) {
-    std::cerr << "attention_ops_kernels_sm80.cu implements dim=64/128/256 (got dim=" << dim
-              << "). Co-link attention_ops_kernels_sm80_d512.cu for dim=512." << std::endl;
-    exit(1);
-  }
+  TORCH_CHECK(handled, "attention_ops_kernels_sm80.cu implements dim=64/128/256, got ", dim);
 #undef DYLLM_SM80_LAUNCH
 
-  if (num_salient > 0) {
-    overwrite_salient_kernel<<<num_salient, 256>>>(c_ptr, o_sal_ptr, o_ptr, idx_salient_row_q, cosine_stats, H * dim);
-  }
-
-  compute_cosine_similarity(cosine_stats, cosine_out, total_seqlen_q, cu_seqlens_q, threshold);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dyllm_overwrite_salient_and_accumulate_stats(c_ptr, o_sal_ptr, o_ptr, idx_salient_row_q, cosine_stats,
+                                               num_salient, H * dim, stream);
+  dyllm_compute_cosine_mask(cosine_stats, cosine_out, total_seqlen_q, threshold, stream);
 }
 
 // Explicit instantiations
@@ -789,43 +645,6 @@ std::vector<int64_t> attention_kernel_info(int dim, bool mask_v_rows) {
   return {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 }
 
-__global__ void fused_offset_kernel(const int* idxs, const int* num_idxs_ptr, const int* cu_promptlens,
-                                    const int* cu_salientlens, const int num_groups, long* out_tensor) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  int limit = *num_idxs_ptr;
-  if (tid >= limit)
-    return;
-
-  int left = 0;
-  int right = num_groups;
-  int group_idx = 0;
-
-  while (left < right) {
-    int mid = left + (right - left) / 2;
-    if (cu_salientlens[mid + 1] <= tid) {
-      left = mid + 1;
-    } else {
-      right = mid;
-    }
-  }
-  group_idx = left;
-
-  long offset_val = (long)cu_promptlens[group_idx + 1];
-
-  out_tensor[tid] = (long)idxs[tid] + offset_val;
-}
-
-void fused_offset_launch(torch::Tensor idxs, torch::Tensor num_idxs, torch::Tensor cu_promptlens,
-                         torch::Tensor cu_salientlens, torch::Tensor out_tensor, int max_threads) {
-  const int threads = 256;
-  const int blocks = (max_threads + threads - 1) / threads;
-
-  fused_offset_kernel<<<blocks, threads>>>(idxs.data_ptr<int>(), num_idxs.data_ptr<int>(),
-                                           cu_promptlens.data_ptr<int>(), cu_salientlens.data_ptr<int>(),
-                                           cu_promptlens.size(0) - 1, out_tensor.data_ptr<long>());
-}
-
 } // namespace dyllm_sm80
 
 // Global entry point. This is the primary TU, so only the plain name needs to be exported.
@@ -853,8 +672,4 @@ std::vector<int64_t> attention_kernel_info(int dim, bool mask_v_rows) {
   return dyllm_sm80::attention_kernel_info(dim, mask_v_rows);
 }
 
-void fused_offset_launch(torch::Tensor idxs, torch::Tensor num_idxs, torch::Tensor cu_promptlens,
-                         torch::Tensor cu_salientlens, torch::Tensor out_tensor, int max_threads) {
-  dyllm_sm80::fused_offset_launch(idxs, num_idxs, cu_promptlens, cu_salientlens, out_tensor, max_threads);
-}
 #endif // DYLLM_SM80_SECONDARY

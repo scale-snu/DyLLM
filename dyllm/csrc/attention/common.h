@@ -1,24 +1,31 @@
 #pragma once
 
-#include <iostream>
 #include <cstdint>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 
-#define CUDA_CHECK(x)                                                                                                  \
-  {                                                                                                                    \
-    auto error = x;                                                                                                    \
-    if (error != cudaSuccess) {                                                                                        \
-      std::cerr << "CUDA error - L" << __LINE__ << ": " << cudaGetErrorString(error) << std::endl;                     \
-      exit(1);                                                                                                         \
-    }                                                                                                                  \
-  }
+#define CUDA_CHECK(x) C10_CUDA_CHECK(x)
 
 inline constexpr int WARP_SIZE = 32;
 
 __device__ __host__ constexpr int cdiv(int a, int b) {
   return (a + b - 1) / b;
 }
+
+struct DyllmBlockInfo {
+  __device__ DyllmBlockInfo(const int* cu_seqlens_q, const int* cu_seqlens_k, int batch_id)
+      : cu_seqlens_q_curr(cu_seqlens_q[batch_id]), cu_seqlens_q_next(cu_seqlens_q[batch_id + 1]),
+        cu_seqlens_k_curr(cu_seqlens_k[batch_id]), cu_seqlens_k_next(cu_seqlens_k[batch_id + 1]),
+        seqlen_q(cu_seqlens_q_next - cu_seqlens_q_curr), seqlen_kv(cu_seqlens_k_next - cu_seqlens_k_curr) {}
+  const int cu_seqlens_q_curr;
+  const int cu_seqlens_q_next;
+  const int cu_seqlens_k_curr;
+  const int cu_seqlens_k_next;
+  const int seqlen_q;
+  const int seqlen_kv;
+};
 
 // Stride in bytes.
 template <int STRIDE> __device__ uint32_t swizzle(uint32_t index) {
@@ -152,8 +159,12 @@ __device__ inline void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
 
 template <typename T, typename... Args>
 void launch_kernel(T* kernel, int num_blocks, int block_size, int smem_size, Args... args) {
+  TORCH_CHECK(num_blocks >= 0, "kernel block count must be non-negative");
+  if (num_blocks == 0)
+    return;
   if (smem_size > 48'000)
     CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  kernel<<<num_blocks, block_size, smem_size>>>(args...);
-  CUDA_CHECK(cudaGetLastError());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  kernel<<<num_blocks, block_size, smem_size, stream>>>(args...);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

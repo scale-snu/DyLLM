@@ -9,7 +9,9 @@ from torch.utils.cpp_extension import (
 
 
 def get_arch_flags():
-    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0 8.6 8.9 9.0 10.0")
+    # Supported deployment targets: A100, H100, and the generic fallback for
+    # Blackwell until a dedicated SM100 kernel is added.
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0 9.0 10.0")
     flags = []
     for arch in arch_list.split():
         num = arch.replace(".", "") + ("a" if arch == "9.0" else "")
@@ -72,6 +74,7 @@ cutlass_includes = get_cutlass_include_dirs()
 attn_defines = ["-DDYLLM_D512_SECONDARY"]
 attn_sources = [
     os.path.join(attn_src, "attention.cpp"),
+    os.path.join(attn_src, "attention_aux_kernels.cu"),
     os.path.join(attn_src, "attention_ops_kernels_sm80.cu"),
     os.path.join(attn_src, "attention_ops_kernels_sm80_d512.cu"),
 ]
@@ -134,10 +137,5 @@ setup(
     packages=find_packages(include=["dyllm*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    entry_points={
-        "console_scripts": [
-            "dyllm-eval = dyllm.eval.eval:cli",
-        ],
-    },
     zip_safe=False,
 )

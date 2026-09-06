@@ -4,7 +4,12 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 
-#define DYLLM_SM90A (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && defined(__CUDA_ARCH_SPECIFIC__))
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && \
+    (defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FEAT_SM90_ALL))
+#define DYLLM_SM90A 1
+#else
+#define DYLLM_SM90A 0
+#endif
 
 namespace dyllm_hopper {
 

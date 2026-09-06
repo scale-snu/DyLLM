@@ -24,6 +24,12 @@
 #define DYLLM_WARP_Q 16
 #endif
 
+// DIM=512 has a separate kernel implementation and therefore separate tuning
+// knobs.  Keep its host-side mask geometry sourced from the same knob.
+#ifndef DYLLM_D512_BLOCK_K
+#define DYLLM_D512_BLOCK_K 32
+#endif
+
 template <int DIM>
 struct DyllmTileDefault {
   static constexpr int BLOCK_Q = 64;
@@ -36,16 +42,16 @@ template <>
 struct DyllmTileDefault<256> {
   // 254 registers / 0 B spills / 32 KB shared memory. No D_SPLIT.
   static constexpr int BLOCK_Q = 64;
-  static constexpr int BLOCK_K = 16;
+  static constexpr int BLOCK_K = 32;
   static constexpr int D_SPLIT = 1;
   static constexpr int WARP_Q = 16;
 };
 
 template <>
 struct DyllmTileDefault<512> {
-  static constexpr int BLOCK_Q = 32;
-  static constexpr int BLOCK_K = 16;
-  static constexpr int D_SPLIT = 4;
+  static constexpr int BLOCK_Q = 64;
+  static constexpr int BLOCK_K = 32;
+  static constexpr int D_SPLIT = 2;
   static constexpr int WARP_Q = 16;
 };
 
@@ -64,12 +70,22 @@ struct DyllmTile {
 #endif
 };
 
-constexpr int dyllm_block_k_for_dim(int dim) {
+constexpr bool dyllm_supported_head_dim(int dim) {
+  return dim == 64 || dim == 128 || dim == 256 || dim == 512;
+}
+
+constexpr int dyllm_sm80_block_k_for_dim(int dim) {
   return dim == 64    ? DyllmTile<64>::BLOCK_K
          : dim == 128 ? DyllmTile<128>::BLOCK_K
          : dim == 256 ? DyllmTile<256>::BLOCK_K
-         : dim == 512 ? DyllmTile<512>::BLOCK_K
-                      : 16;
+         : dim == 512 ? DYLLM_D512_BLOCK_K
+                      : 0;
+}
+
+// Hopper kernels use one uint64 mask word per 64 key rows, independently of
+// their wider attention tile. Generic kernels use their actual BLOCK_K.
+constexpr int dyllm_row_mask_block_for_dim(int dim, bool use_sm90) {
+  return use_sm90 ? 64 : dyllm_sm80_block_k_for_dim(dim);
 }
 
 #ifndef DYLLM_BUILD_DIM

@@ -1,5 +1,7 @@
 #include "common.h"
+#include "attention_aux.h"
 #include "hopper_common.cuh"
+#include "hopper_host.h"
 
 #include <cuda_bf16.h>
 #include <float.h>
@@ -61,148 +63,6 @@ struct Sm90Tile {
 
 
 using namespace dyllm_hopper;
-
-struct BlockInfo {
-  __device__ BlockInfo(const int* cu_seqlens_q, const int* cu_seqlens_k, int batch_id)
-      : cu_seqlens_q_curr(cu_seqlens_q[batch_id]), cu_seqlens_q_next(cu_seqlens_q[batch_id + 1]),
-        cu_seqlens_k_curr(cu_seqlens_k[batch_id]), cu_seqlens_k_next(cu_seqlens_k[batch_id + 1]),
-        seqlen_q(cu_seqlens_q_next - cu_seqlens_q_curr), seqlen_kv(cu_seqlens_k_next - cu_seqlens_k_curr) {}
-  const int cu_seqlens_q_curr;
-  const int cu_seqlens_q_next;
-  const int cu_seqlens_k_curr;
-  const int cu_seqlens_k_next;
-  const int seqlen_q;
-  const int seqlen_kv;
-};
-
-__global__ void cosine_similarity_reduce_kernel(const float* __restrict__ stats, // [total_tokens, 3]
-                                                bool* __restrict__ out,          // [total_tokens]
-                                                const int total_tokens, const int* __restrict__ cu_seqlens_q,
-                                                const float threshold) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_tokens)
-    return;
-
-  float dot = stats[idx * 3 + 0];
-  float norm_a = stats[idx * 3 + 1];
-  float norm_b = stats[idx * 3 + 2];
-
-  float rsqrt_norm_a = rsqrtf(fmaxf(norm_a, 1e-8f));
-  float rsqrt_norm_b = rsqrtf(fmaxf(norm_b, 1e-8f));
-
-  float cos_sim = dot * rsqrt_norm_a * rsqrt_norm_b;
-  out[idx] = (cos_sim < threshold);
-}
-
-void compute_cosine_similarity(const float* stats, bool* out, const int total_tokens, const int* cu_seqlens_q,
-                               const float threshold) {
-  int threads = 256;
-  int blocks = (total_tokens + threads - 1) / threads;
-  cosine_similarity_reduce_kernel<<<blocks, threads, 0>>>(stats, out, total_tokens, cu_seqlens_q, threshold);
-}
-
-__global__ void overwrite_salient_kernel(const nv_bfloat16* __restrict__ c,
-                                          const nv_bfloat16* __restrict__ o_sal,
-                                          nv_bfloat16* __restrict__ o,
-                                          const int* __restrict__ idx_salient_row,
-                                          float* __restrict__ cosine_stats, const int vector_size) {
-  const int salient_idx = blockIdx.x;
-  const int token_idx = idx_salient_row[salient_idx];
-  const int pair_count = vector_size / 2;
-  const nv_bfloat162* old_row = reinterpret_cast<const nv_bfloat162*>(c + token_idx * vector_size);
-  const nv_bfloat162* new_row = reinterpret_cast<const nv_bfloat162*>(o_sal + salient_idx * vector_size);
-  nv_bfloat162* out_row = reinterpret_cast<nv_bfloat162*>(o + token_idx * vector_size);
-
-  float3 local = {0.0f, 0.0f, 0.0f};
-  for (int pair = threadIdx.x; pair < pair_count; pair += blockDim.x) {
-    const nv_bfloat162 old_v = old_row[pair];
-    const nv_bfloat162 new_v = new_row[pair];
-    out_row[pair] = new_v;
-    const float2 old_f = __bfloat1622float2(old_v);
-    const float2 new_f = __bfloat1622float2(new_v);
-    local.x += new_f.x * old_f.x + new_f.y * old_f.y;
-    local.y += new_f.x * new_f.x + new_f.y * new_f.y;
-    local.z += old_f.x * old_f.x + old_f.y * old_f.y;
-  }
-
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local.x += __shfl_down_sync(0xffffffff, local.x, offset);
-    local.y += __shfl_down_sync(0xffffffff, local.y, offset);
-    local.z += __shfl_down_sync(0xffffffff, local.z, offset);
-  }
-
-  __shared__ float3 warp_stats[8];
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  if (lane == 0)
-    warp_stats[warp] = local;
-  __syncthreads();
-
-  if (warp == 0) {
-    local = lane < blockDim.x / 32 ? warp_stats[lane] : make_float3(0.0f, 0.0f, 0.0f);
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      local.x += __shfl_down_sync(0xffffffff, local.x, offset);
-      local.y += __shfl_down_sync(0xffffffff, local.y, offset);
-      local.z += __shfl_down_sync(0xffffffff, local.z, offset);
-    }
-    if (lane == 0) {
-      cosine_stats[token_idx * 3 + 0] = local.x;
-      cosine_stats[token_idx * 3 + 1] = local.y;
-      cosine_stats[token_idx * 3 + 2] = local.z;
-    }
-  }
-}
-
-__global__ void compute_k_block_mask_kernel(const int* __restrict__ idx_salient_row,
-                                            const int* __restrict__ cu_salientlens,
-                                            const int* __restrict__ cu_seqlens_k, uint64_t* __restrict__ row_masks,
-                                            const int total_blocks, const int num_blk_k, const int block_k) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_blocks)
-    return;
-
-  const int batch_id = idx / num_blk_k;
-  const int block_id = idx - batch_id * num_blk_k;
-  const int seq_start = cu_seqlens_k[batch_id];
-  const int seq_end = cu_seqlens_k[batch_id + 1];
-  const int block_start = seq_start + block_id * block_k;
-  if (block_start >= seq_end) {
-    row_masks[idx] = 0;
-    return;
-  }
-  const int block_end = min(block_start + block_k, seq_end);
-
-  int left = cu_salientlens[batch_id];
-  int right = cu_salientlens[batch_id + 1];
-  while (left < right) {
-    const int mid = (left + right) >> 1;
-    if (idx_salient_row[mid] < block_start)
-      left = mid + 1;
-    else
-      right = mid;
-  }
-  uint64_t mask = 0;
-  const int salient_end = cu_salientlens[batch_id + 1];
-  while (left < salient_end && idx_salient_row[left] < block_end) {
-    mask |= 1ULL << (idx_salient_row[left] - block_start);
-    ++left;
-  }
-  row_masks[idx] = mask;
-}
-
-void compute_k_masks(const int batch_size, const int* cu_seqlens_k, const int* cu_salientlens_k,
-                     const int* idx_salient_row_k, const int num_salient_k, const int BLOCK_K, const int max_seqlen_k,
-                     uint64_t* row_masks) {
-
-  int num_blk_k = (max_seqlen_k + BLOCK_K - 1) / BLOCK_K;
-  const int total_blocks = batch_size * num_blk_k;
-  constexpr int threads = 256;
-  const int blocks = cdiv(total_blocks, threads);
-  compute_k_block_mask_kernel<<<blocks, threads>>>(idx_salient_row_k, cu_salientlens_k, cu_seqlens_k, row_masks,
-                                                   total_blocks, num_blk_k, BLOCK_K);
-}
 
 // Main kernel
 template <int BLOCK_Q, int BLOCK_K, int DIM, int STAGES, bool WS, int NUM_MMA_WG, bool OVERLAP,
@@ -289,7 +149,7 @@ __launch_bounds__(WS ? (1 + NUM_MMA_WG) * 128 : 128, NUM_MMA_WG == 1 ? 2 : 1) __
   const int blk_q_id = bid % num_blk_q;
   const int kv_head_id = head_id / (H / H_kv);
 
-  BlockInfo binfo(cu_seqlens_q, cu_seqlens_k, batch_id);
+  DyllmBlockInfo binfo(cu_seqlens_q, cu_seqlens_k, batch_id);
   const int num_kv_iter = cdiv(binfo.seqlen_kv, BLOCK_K);
   const uint64_t* row_masks_batch = row_masks + batch_id * num_blk_kv;
 
@@ -726,34 +586,8 @@ __launch_bounds__(WS ? (1 + NUM_MMA_WG) * 128 : 128, NUM_MMA_WG == 1 ? 2 : 1) __
 #endif
 }
 
-static PFN_cuTensorMapEncodeTiled_v12000 dyllm_tma_encode() {
-  static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
-    void* p = nullptr;
-    cudaDriverEntryPointQueryResult qr;
-    cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &p, 12000, cudaEnableDefault, &qr);
-    TORCH_CHECK(p != nullptr && qr == cudaDriverEntryPointSuccess, "cuTensorMapEncodeTiled unavailable");
-    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(p);
-  }();
-  return fn;
-}
-
-// View [total_seq, heads, DIM] as a three-dimensional (DIM, heads, total_seq) TMA tensor.
-// The box width is one swizzle block; rows beyond total_seq are filled with zero.
-static CUtensorMap dyllm_make_map(const void* base, int total_seq, int heads, int dim, int box_rows) {
-  CUtensorMap tm{};
-  uint64_t gdim[3] = {static_cast<uint64_t>(dim), static_cast<uint64_t>(heads), static_cast<uint64_t>(total_seq)};
-  uint64_t gstr[2] = {static_cast<uint64_t>(dim) * 2ull, static_cast<uint64_t>(heads) * dim * 2ull};
-  uint32_t bdim[3] = {static_cast<uint32_t>(dyllm_hopper::SWZ_COLS), 1u, static_cast<uint32_t>(box_rows)};
-  uint32_t estr[3] = {1u, 1u, 1u};
-  CUresult r = dyllm_tma_encode()(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(base), gdim, gstr, bdim,
-                                  estr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                  CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", static_cast<int>(r));
-  return tm;
-}
-
 template <int DIM>
-static void launch_for_dim(const nv_bfloat16* q_ptr, const nv_bfloat16* k_ptr, const nv_bfloat16* v_ptr,
+static void launch_attention_for_dim(const nv_bfloat16* q_ptr, const nv_bfloat16* k_ptr, const nv_bfloat16* v_ptr,
                            const nv_bfloat16* c_ptr, nv_bfloat16* o_ptr, const int B, const int H, const int H_kv,
                            const int* cu_seqlens_q, const int* cu_seqlens_k, const int max_seqlen_q,
                            const int max_seqlen_k, const int total_seqlen_q, const int num_salient,
@@ -761,20 +595,22 @@ static void launch_for_dim(const nv_bfloat16* q_ptr, const nv_bfloat16* k_ptr, c
                            float* cosine_stats, int total_kv) {
   using T = Sm90Tile<DIM>;
 
-  CUtensorMap tmQ = dyllm_make_map(q_ptr, total_seqlen_q, H, DIM, SM90_BLOCK_Q);
-  CUtensorMap tmK = dyllm_make_map(k_ptr, total_kv, H_kv, DIM, T::BLOCK_K);
-  CUtensorMap tmV = dyllm_make_map(v_ptr, total_kv, H_kv, DIM, T::BLOCK_K);
+  CUtensorMap tmQ = make_tma_tensor_map(q_ptr, total_seqlen_q, H, DIM, SM90_BLOCK_Q);
+  CUtensorMap tmK = make_tma_tensor_map(k_ptr, total_kv, H_kv, DIM, T::BLOCK_K);
+  CUtensorMap tmV = make_tma_tensor_map(v_ptr, total_kv, H_kv, DIM, T::BLOCK_K);
 
-  compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, num_salient, SM90_MASK_BLOCK, max_seqlen_k,
-                  row_masks);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dyllm_compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, SM90_MASK_BLOCK, max_seqlen_k, row_masks,
+                        stream);
 
   const int num_blocks = B * H * cdiv(max_seqlen_q, SM90_BLOCK_Q);
   auto kernel = attention_h100_kernel<SM90_BLOCK_Q, T::BLOCK_K, DIM, SM90_STAGES, SM90_WS, SM90_MMA_WG, SM90_OVERLAP,
                                       Sm90Cfg<DIM>::MASK_FORM>;
   CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM));
-  kernel<<<num_blocks, SM90_TB, T::SMEM>>>(tmQ, tmK, tmV, c_ptr, o_ptr, B, H, H_kv, cu_seqlens_q, cu_seqlens_k,
-                                           max_seqlen_q, max_seqlen_k, cu_salientlens, row_masks, cosine_stats);
-  CUDA_CHECK(cudaGetLastError());
+  kernel<<<num_blocks, SM90_TB, T::SMEM, stream>>>(tmQ, tmK, tmV, c_ptr, o_ptr, B, H, H_kv, cu_seqlens_q,
+                                                   cu_seqlens_k, max_seqlen_q, max_seqlen_k, cu_salientlens,
+                                                   row_masks, cosine_stats);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename scalar_t>
@@ -786,8 +622,7 @@ void attention_sparse_varlen(const scalar_t* q, const scalar_t* k, const scalar_
                              uint64_t* row_masks, float* cosine_stats, bool* cosine_out, float threshold, int dim,
                              int force_mask_v_rows, int total_kv) {
   if constexpr (!std::is_same_v<scalar_t, at::BFloat16>) {
-    std::cerr << "Only BFloat16 is supported" << std::endl;
-    exit(1);
+    TORCH_CHECK(false, "Only BFloat16 is supported");
   }
 
   const auto* q_ptr = reinterpret_cast<const nv_bfloat16*>(q);
@@ -798,9 +633,9 @@ void attention_sparse_varlen(const scalar_t* q, const scalar_t* k, const scalar_
   auto* o_ptr = reinterpret_cast<nv_bfloat16*>(o);
 
 #define DYLLM_SM90_LAUNCH(D)                                                                                           \
-  launch_for_dim<D>(q_ptr, k_ptr, v_ptr, c_ptr, o_ptr, B, H, H_kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,           \
-                    max_seqlen_k, total_seqlen_q, num_salient, cu_salientlens, idx_salient_row_k, row_masks,           \
-                    cosine_stats, total_kv)
+  launch_attention_for_dim<D>(q_ptr, k_ptr, v_ptr, c_ptr, o_ptr, B, H, H_kv, cu_seqlens_q, cu_seqlens_k,              \
+                              max_seqlen_q, max_seqlen_k, total_seqlen_q, num_salient, cu_salientlens,                 \
+                              idx_salient_row_k, row_masks, cosine_stats, total_kv)
   bool handled = false;
   if constexpr (DYLLM_DIM_ENABLED(64)) {
     if (dim == 64) {
@@ -823,9 +658,10 @@ void attention_sparse_varlen(const scalar_t* q, const scalar_t* k, const scalar_
   TORCH_CHECK(handled, "attention_ops_kernels_sm90.cu implements dim=64/128/256, got ", dim);
 #undef DYLLM_SM90_LAUNCH
 
-  if (num_salient > 0)
-    overwrite_salient_kernel<<<num_salient, 256>>>(c_ptr, o_sal_ptr, o_ptr, idx_salient_row_q, cosine_stats, H * dim);
-  compute_cosine_similarity(cosine_stats, cosine_out, total_seqlen_q, cu_seqlens_q, threshold);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dyllm_overwrite_salient_and_accumulate_stats(c_ptr, o_sal_ptr, o_ptr, idx_salient_row_q, cosine_stats,
+                                               num_salient, H * dim, stream);
+  dyllm_compute_cosine_mask(cosine_stats, cosine_out, total_seqlen_q, threshold, stream);
   (void)force_mask_v_rows;
 }
 
@@ -874,7 +710,7 @@ std::vector<int64_t> attention_kernel_info(int dim, bool mask_v_rows) {
 
 } // namespace dyllm_sm90
 
-void attention_sparse_varlen_h100(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v,
+void attention_sparse_varlen_sm90(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v,
                                   const at::BFloat16* c, const at::BFloat16* o_sal, at::BFloat16* o, const int B,
                                   const int H, const int H_kv, const int* cu_seqlens_q, const int* cu_seqlens_k,
                                   const int max_seqlen_q, const int max_seqlen_k, const int total_seqlen_q,
@@ -886,7 +722,7 @@ void attention_sparse_varlen_h100(const at::BFloat16* q, const at::BFloat16* k, 
       row_masks, cosine_stats, cosine_out, threshold, dim, force_mask_v_rows, total_kv);
 }
 
-std::vector<int64_t> attention_kernel_info_h100(int dim, bool mask_v_rows) {
+std::vector<int64_t> attention_kernel_info_sm90(int dim, bool mask_v_rows) {
   return dyllm_sm90::attention_kernel_info(dim, mask_v_rows);
 }
 
