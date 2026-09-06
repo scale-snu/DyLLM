@@ -26,5 +26,8 @@ dependencies = [
     "pillow>=11.3.0"
 ]
 
+[project.scripts]
+dyllm-eval = "dyllm.eval.eval:cli"
+
 [tool.black]
 line-length = 120
