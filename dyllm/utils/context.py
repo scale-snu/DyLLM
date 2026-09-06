@@ -24,6 +24,20 @@ class Context:
     total_seqlen_k: int = 0
     total_seqlen: int = 0
     positions_k: Optional[torch.Tensor] = None
+    # --- everything below is DiffusionGemma-only (defaults keep the mask-based models unchanged) ---
+    attn_mode: str = "causal"
+    self_conditioning: Optional[torch.Tensor] = None
+    step_cache: Optional[dict] = None
+    kv_cache_caps: Optional[List[int]] = None
+    canvas_len: int = 0
+    full_rows: Optional[torch.Tensor] = None  # [sum Q] bool, rows that run dense (first steps of a canvas)
+    # sparse-attention cascade: the layer publishes its context cache before
+    # attention; attention writes back the per-row cos verdict (kernel semantics)
+    ctx_cache: Optional[torch.Tensor] = None
+    salient_rows: Optional[torch.Tensor] = None
+    # mixed batch: per-seq causal flags (encode=True, denoise=False); None = uniform attn_mode
+    modes: Optional[List[bool]] = None
+    denoise_rows: Optional[torch.Tensor] = None  # [sum Q] bool, rows that belong to denoise segments
 
 
 _CONTEXT = Context()
@@ -51,6 +65,14 @@ def set_context(
     total_seqlen_k=0,
     total_seqlen=0,
     positions_k=None,
+    attn_mode="causal",
+    self_conditioning=None,
+    step_cache=None,
+    kv_cache_caps=None,
+    canvas_len=0,
+    full_rows=None,
+    modes=None,
+    denoise_rows=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -71,6 +93,14 @@ def set_context(
         total_seqlen=total_seqlen,
         total_seqlen_k=total_seqlen_k,
         positions_k=positions_k,
+        attn_mode=attn_mode,
+        self_conditioning=self_conditioning,
+        step_cache=step_cache,
+        kv_cache_caps=kv_cache_caps,
+        canvas_len=canvas_len,
+        full_rows=full_rows,
+        modes=modes,
+        denoise_rows=denoise_rows,
     )
 
 

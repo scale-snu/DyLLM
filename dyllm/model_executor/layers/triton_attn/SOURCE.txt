@@ -1,0 +1,14 @@
+vLLM main (2026-08-18):
+  vllm/v1/attention/ops/triton_unified_attention.py
+  vllm/v1/attention/ops/triton_attention_helpers.py
+kernel code unmodified; only imports rewired to _shim.py. Apache-2.0.
+Local edit (08-18): removed the Intel tensor-descriptor path (USE_TD/USE_TD_QO branches +
+_load_q_td/_load_kv_tile_td/_store_output_td helpers) -- tl.make_tensor_descriptor needs
+Triton >= 3.6, server has 3.5.1; the path is Intel Xe only. Kernel math untouched.
+Local edit (08-18, mixed batch): under USE_PER_SEQ_CAUSAL, bidirectional (denoise) rows
+ignore SLIDING_WINDOW in all three places (kv mask, tile-loop bounds, V-load mask) --
+DyLLM-DG keeps the sliding pool trimmed to W-1 so denoise rows attend the whole region;
+the window applies to causal (encode) rows only. compute_tile_loop_bounds gained a runtime
+`is_causal_seq` argument for this.
+- LAUNCH_OVERRIDE dict (block_m / num_warps / num_stages / tile_prefill) for launch-config tuning probes; empty = upstream defaults.
+- tuned_sm80 branch (A100): BLOCK_M 64 / 8 warps / 2 stages, TILE 64 for head 256 (32 for 512) -- ~2x on our canvas geometries (probe_triton_tune.py 08-18).

@@ -1,12 +1,11 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 from flash_attn import flash_attn_varlen_func
-import flash_attn_2_cuda as flash_attn_gpu
 
-from dyllm.utils.context import get_context, set_context
+from dyllm.utils.context import get_context
 from dyllm.utils.metadata import get_metadata
 from dyllm.engine.cache_manager import CacheManager
+from dyllm.distributed import tensor_parallel_cosine_mask
 
 from dyllm.attention_ops import attention_sparse_varlen, fused_offset_launch
 
@@ -33,8 +32,6 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         ctx = get_context()
         metadata = get_metadata()
-        num_repeat = self.num_heads // self.num_kv_heads
-
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -116,7 +113,6 @@ class Attention(nn.Module):
             # new_c = flash_attn_varlen_func(
             #     q, k, v_cache, cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k, max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k, dropout_p=0.0, softmax_scale=self.scale, causal=False
             # )
-            
 
             # cos_sim = F.cosine_similarity(c_cache.flatten(-2, -1), new_c.flatten(-2, -1), dim=-1)  # [L]
             # idxs = torch.nonzero(cos_sim < self.threshold, as_tuple=False).squeeze(-1).contiguous()
@@ -141,6 +137,12 @@ class Attention(nn.Module):
                 is_q_pruned,
                 idx_salient_row_k.to(torch.int32),
             )
+
+            # Context heads are tensor-parallel shards.  The CUDA kernel emits
+            # the three additive cosine terms for the local shard; summing only
+            # these FP32 statistics gives the exact cosine of the concatenated
+            # global context vector without gathering that vector.
+            cos_sim_mask.copy_(tensor_parallel_cosine_mask(cos_sim_stats, self.threshold))
 
             idxs = torch.nonzero(cos_sim_mask, as_tuple=False).squeeze(-1).contiguous()
             num_valid = idxs.numel()
